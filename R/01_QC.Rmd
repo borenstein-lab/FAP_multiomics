@@ -1,0 +1,606 @@
+---
+title: "FAP 16S Raw Data Processing Notes - Batches 2022 & 2024"
+author: "Alisa Greenberg, Borenstein Lab"
+date: "January 2025"
+output:
+  html_document:
+    css: custom_notebook_formatting.css
+    toc: yes
+    toc_depth: 3
+    df_print: paged
+    code_folding: hide
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align = 'center')
+```
+
+```{r message=FALSE, warning=FALSE}
+# Preparations
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(ape)
+#tinytex::install_tinytex()
+```
+
+
+## Raw data description
+
+### Raw 16S data
+
+Overall, 166 FASTQ files were received, including forward and reverse reads of 185 samples.  
+
+The 16S region amplified is the V3-V4, using primers:  
+Forward: CCTACGGGNGGCWGCAG  
+Reverse: GACTACHVGGGTATCTAATCC  
+
+The reads are paired-end, 250 nt in each direction.  
+
+### Metadata
+
+TODO - DESCRIBE METADATA
+
+```{r fig.width=8, fig.height=7, fig.align="center"}
+sample_metadata <- read.csv("metadata/clean/metadata_combined.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+core_mdata_cols <- c("patient_id","sample_id", "phenotype", "batch", "surgery_type" ,  "bmi", "gender","age","phenotype", "is_current_smoker", "is_ever_smoker", 
+                     "colonoscopy_classification","is_colono", "is_polip_history" ,"is_polip" )
+core_mdata <- sample_metadata %>% select(all_of(core_mdata_cols)) %>% rename(sample = sample_id) %>% 
+              mutate(phenotype = factor(phenotype, levels = c("Severe FAP", "Mild FAP","Fatty Liver","No Fatty Liver" )))
+```
+
+```{r}
+palette_df <- read.csv("metadata/clean/project_palette.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+palette <- palette_df$color
+names(palette) <- palette_df$label
+```
+
+## Raw data quality
+
+### Read quality
+
+The following plots show the distribution of read quality at each position along the read. As a rule of thumb, quality scores over 30 (red dashed line) are considered good.  
+
+```{r fig.width=8, fig.height=4, fig.align="center", message=FALSE}
+fwd_quality <- read_delim("qiime/combined/1_Import/forward-seven-number-summaries.tsv", 
+                          delim = "\t", show_col_types = FALSE, 
+                          escape_double = FALSE, trim_ws = TRUE)
+rev_quality <- read_delim("qiime/combined/1_Import/reverse-seven-number-summaries.tsv", 
+                          delim = "\t", show_col_types = FALSE, 
+                          escape_double = FALSE, trim_ws = TRUE)
+
+plot_quality <- function(df, direction = 'Forward', vlines = c()){
+  # Reorganize table
+  df <- df %>%
+    filter(...1 != 'count') %>%
+    tibble::column_to_rownames('...1') %>%
+    t() %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column('Position') %>%
+    rename_with(function(colname) gsub('%','_quantile',colname)) %>%
+    mutate(Position = as.numeric(Position))
+  
+  ggp<- ggplot(df, aes(x = Position, group = Position)) +
+        geom_boxplot(aes(ymin = `9_quantile`, 
+                         lower = `25_quantile`, 
+                         middle = `50_quantile`, 
+                         upper = `75_quantile`, 
+                         ymax = `91_quantile`),
+                     stat = "identity", fill = 'cadetblue3', color = 'grey30') +
+        geom_hline(yintercept = 30, linetype = 'dashed', color = 'darkred') +
+        theme_classic() +
+        ggtitle(paste('Quality plot -', direction, 'reads')) +
+        ylim(c(0,40)) +
+        ylab('Quality score') +
+        scale_x_continuous(expand = c(0,0)) +
+        theme(plot.title = element_text(hjust = 0.5))
+  for (vline in vlines) {
+    ggp <- ggp + geom_vline(xintercept = vline, linetype = 'dashed', color = 'black') 
+  }
+  plot(ggp)
+}
+
+plot_quality(fwd_quality, vline = c(20,165))
+plot_quality(rev_quality, direction = 'Reverse')
+```
+
+### Sequencing depth
+
+```{r fig.width=8, fig.height=3, fig.align="center"}
+step.names <- c("input"="0-Input","filtered"="1-Filtered","denoised"="2-Denoised","merged"="3-Merged","non-chimeric"="4-Non-Chimeric")
+
+dada_stats <- read_delim("qiime/combined/2_Denoise_EE34_Pooled/stats_dada2_exported/stats.tsv", 
+                         delim = "\t", 
+                         escape_double = FALSE, 
+                         comment = "#", 
+                         show_col_types = FALSE,
+                         trim_ws = TRUE)
+
+dada_stats <- dada_stats %>% 
+  select(`sample-id`, input, filtered, denoised,  `non-chimeric`) %>%
+  tidyr::pivot_longer(cols = -`sample-id`, names_to = "Step", values_to = "Count") %>%
+  mutate(Step = step.names[Step])
+
+dada_stats %>%
+  filter(Step == '0-Input') %>%
+  ggplot(aes(x = Count)) +
+  geom_histogram(color = 'black', fill = 'cadetblue3', binwidth = 5000) +
+  ggtitle('Distribution of reads per sample - raw data') +
+  xlab("Read count") +
+  ylab("Number of samples") +
+  scale_x_continuous(expand = c(0,0),
+                     labels = function(x) format(x, big.mark = ",", scientific = F), 
+                     breaks = seq(0, max(dada_stats$Count), 20000)) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 8, hjust = 1)) 
+```
+
+***
+
+## DADA2 denoising
+
+[DADA2 algorithm](https://benjjneb.github.io/dada2/index.html) was used for the denoising of raw reads. The DADA2 pipeline specifically includes the following steps:  
+
+* Trimming and quality filtering  
+* Learning error models and finding unique amplicon sequence variants (ASV's)  
+* Merging paired reads  
+* Removing chimeras
+
+DADA2 processing was performed using the qiime plugin, with the following non-default parameters:  
+
+| Parameter            | Description                                             |
+|----------------------|---------------------------------------------------------|
+|`DADA_TRIM_LEFT_F=15` | Forward read - left trimming                            |
+|`DADA_TRUNC_LEN_F=165`| Forward read - truncation length (0 means no truncation)|  
+|`DADA_TRIM_LEFT_R=0`  | Reverse read - left trimming (not used)                 |  
+|`DADA_TRUNC_LEN_R=0`  | Reverse read - truncation length (not used)             |  
+|`DADA_MAX_EE_F=3`		 | Controls the quality filtering done by DADA. Default: 2 |
+|`DADA_MAX_EE_R=4`		 | Same as above, for reverse reads                        |
+|`DADA_POOLING=pseudo` | [Pool samples](https://benjjneb.github.io/dada2/pseudo.html#Pseudo-pooling) to identify variants more sensitively. |  
+
+
+The following plot provides an overview of the number of reads discarded at each step.  
+```{r fig.width=5.5, fig.height=3, fig.align="center"}
+samples.to.exclude <- c()
+pd <- position_dodge(width = 0.4)
+
+ggplot(dada_stats %>% filter(! `sample-id` %in% samples.to.exclude), 
+       aes(x = Step, y = Count, fill = Step)) +
+  geom_boxplot(color = 'black', width = 0.7, outlier.shape = NA) +
+  geom_point(aes(group = `sample-id`), alpha = 0.4, position = pd, size = 1) +
+  geom_line(aes(group = `sample-id`), position = pd, alpha = 0.1) +
+  scale_fill_brewer(palette = 'PuBuGn') +
+  ggtitle('Number of reads after each DADA2 processing step') +
+  theme_classic() +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+rm(samples.to.exclude)
+```
+
+Final distribution of read counts per sample:
+
+```{r fig.width=8, fig.height=3, fig.align="center"}
+dada_stats %>%
+  filter(Step == '4-Non-Chimeric') %>%
+  ggplot(aes(x = Count)) +
+  geom_histogram(color = 'black', fill = 'cadetblue3', binwidth = 5000) +
+  ggtitle('Distribution of reads per sample - after denoising') +
+  xlab("Read count") +
+  ylab("Number of samples") +
+  scale_x_continuous(expand = c(0,0),
+                     labels = function(x) format(x, big.mark = ",", scientific = F), 
+                     breaks = seq(0, max(dada_stats$Count), 20000)) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 8, hjust = 1)) 
+```
+
+
+__Low-quality samples__
+TODO - EDIT WHEN YOU KNOW THE QUALITY OF THE OTHER BATCH
+Because of the overall high quality and our aim to keep as many samples as possible, we decided to keep all samples in the analysis. However, it is important to note that some samples have a lower number of reads than others. This may affect the downstream analysis, especially when comparing samples with different read counts.
+
+
+__Identified ASV's__
+
+```{r}
+dada_table <- read_delim("qiime/combined/2_Denoise_EE34_Pooled/table_dada2_exported/feature_table.tsv",
+                         delim = "\t", escape_double = FALSE, 
+                         trim_ws = TRUE, skip = 1, 
+                         show_col_types = FALSE)
+
+n_asvs <- nrow(dada_table)
+# Below formula counts the number of ASV's that appear in less than 10% of samples
+n_asvs_10_perc <- sum(rowSums(dada_table[,-1] > 0) < 0.1*(ncol(dada_table)-1))
+```
+
+Overall, `r n_asvs` unique ASV's were identified. `r n_asvs_10_perc` of which are relatively rare and appear in <10% of the samples.
+
+ASV prevalence (i.e. in how many samples did each ASV appear) are plotted below:
+
+```{r fig.width=8, fig.height=3, fig.align="center"}
+tmp <- dada_table %>% tibble::column_to_rownames("#OTU ID")
+tmp <- tmp > 0
+asv_frequencies <- data.frame(asv_freq = rowSums(tmp)/ncol(tmp))
+
+ggplot(asv_frequencies, aes(x = asv_freq)) +
+  geom_histogram(color = 'black', fill = 'cadetblue1', alpha = 0.6, bins = 50) +
+  ggtitle('Distribution of ASV frequencies') +
+  xlab("ASV frequency (% of samples)") +
+  ylab("Number of ASVs") +
+  scale_x_continuous(expand = c(0,0), labels = scales::percent) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) 
+```
+
+
+***
+
+## Rarefaction curves
+
+Rarefaction curves describe the number of observed species (here: sequence variants, ASVs) against the number of reads per sample. The curve is created by randomly re-sampling the pool of reads available for each sample and then plotting the average number of ASVs identified from the chosen reads. Generally, it initially grows rapidly and then slightly flattens (as the rarest species remain to be sampled).
+
+```{r fig.height=5, fig.width=8, fig.align='center'}
+observed_rar <- read_csv("qiime/combined/5_Diversity/rarefaction_curves/observed_features.csv", 
+                         show_col_types = FALSE)
+observed_rar <- observed_rar %>%
+  select(-batch) %>%
+  tidyr::pivot_longer(cols = -`sample-id`, 
+                      names_to = 'depth_iter', 
+                      values_to = 'asv_count',
+                      values_drop_na = TRUE) %>%
+  tidyr::separate(sep = '_', 
+                  remove = TRUE, 
+                  col = 'depth_iter', 
+                  into = c('depth','iter')) %>%
+  mutate(depth = as.numeric(gsub('depth\\-','',depth))) %>%
+  group_by(`sample-id`, depth) %>%
+  summarise(mean_asv_count = mean(asv_count), .groups = 'drop')
+
+tmp_palette <- colorRampPalette(RColorBrewer::brewer.pal(9,name = 'BrBG'))(n_distinct(observed_rar$`sample-id`))
+ggplot(observed_rar, aes(x = depth, color = `sample-id`, y = mean_asv_count)) +
+  geom_line() +
+  geom_point() +
+  scale_color_manual(values = tmp_palette) +
+  theme_classic() +
+  ggtitle('Rarefaction curves - ASV count') +
+  xlab('Sequencing depth') +
+  ylab('ASV count') +
+  theme(legend.position = 'none') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+rm(tmp_palette, observed_rar)
+```
+***
+
+## Alpha-diversity
+
+Alpha-diversity metrics measure the diversity of the microbial community (at the ASV level) within each sample. The following metrics were computed:  
+
+- *Shannon diversity*: This index quantifies the uncertainty in predicting the species identity of an individual that is taken at random from the dataset. The higher the value, the higher the diversity of species is in the particular community. A value of 0 indicates a community that only has one species.  
+- *Faith phylogenetic diversity*: This index also takes into account phylogenetic relatedness of species within a sample. See [here](https://danielpfaith.wordpress.com/phylogenetic-diversity/). Higher values indicate a larger spread over the phylogenetic tree, i.e. higher diversity.  
+
+```{r fig.height=3, fig.width=8, fig.align='center', message = FALSE}
+faith_pd <- read_delim("qiime/combined/5_Diversity/faith_pd_vector_exported/alpha-diversity.tsv", 
+                       delim = "\t", 
+                       escape_double = FALSE, 
+                       trim_ws = TRUE, 
+                       show_col_types = FALSE)
+shannon <- read_delim("qiime/combined/5_Diversity/shannon_vector_exported/alpha-diversity.tsv", 
+                       delim = "\t", 
+                       escape_double = FALSE, 
+                       trim_ws = TRUE, 
+                       show_col_types = FALSE)
+alpha_div <- bind_rows(faith_pd %>% rename(sample = 1, val = 2) %>% mutate(metric = 'Faith PD'),
+                       shannon %>% rename(sample = 1, val = 2) %>% mutate(metric = 'Shannon'))
+
+ggplot(alpha_div, aes(x = val)) +
+  geom_histogram(color = 'black', fill = 'darkolivegreen3', alpha = 0.6) +
+  ggtitle('Distribution of alpha-diversity values') +
+  xlab("Diversity value") +
+  ylab("Number of samples") +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw() +
+  facet_wrap(~ metric, nrow = 1, scales = "free") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+
+***
+
+## Prinicipal coordinate analysis (PCoA)
+
+We run PCoA with Bray-Curtis/ Weighted UniFrac distances to show an overview of samples and similarity between them. Samples from the same subject are connected with a line.
+
+
+```{r}
+get_pcoa <- function(df, n_dims){
+  PCOA <- df %>% as.dist() %>% pcoa()
+  eig_vals <- round(100* PCOA$values$Relative_eig[1:3],n_dims)
+  pcoa_df <- PCOA$vectors[,1:n_dims] %>% as.data.frame() %>% tibble::rownames_to_column('sample')
+  colnames(pcoa_df) <- gsub("Axis.", "axis_", colnames(pcoa_df))
+  return(list(eig_vals, pcoa_df))
+}
+
+plot_pcoa<- function(ggdata, x_var, y_var,  eig_vals,metric, color_Var = "sample"){
+  ggp <- ggplot(ggdata,aes_string(paste0("axis_", x_var), paste0("axis_", y_var), color = color_Var)) +
+        geom_point(size = 2, alpha = 0.7) + 
+        ggtitle(paste0('PCoA - ',metric,' (Axes ',x_var,' vs. ',y_var,')')) +
+        xlab(paste0('Axis ',x_var,' (', eig_vals[x_var], '% variance explained)')) +
+        ylab(paste0('Axis ',y_var,' (', eig_vals[y_var], '% variance explained)')) +
+        theme_classic() +
+        theme(plot.title = element_text(hjust = 0.5))
+  return(ggp)
+  
+}
+plot_pcoa_from_dist_mat <- function(dist_df, metric_name, axis_x = 1, axis_y = 2, color_Var = "sample", n_dims = 3, mdata = NULL) {
+  pcoa_df <- get_pcoa(dist_df, n_dims)
+  eig_vals <- pcoa_df[[1]]
+  pcoa_df <- pcoa_df[[2]] 
+  if (!is.null(mdata)){
+    pcoa_df <- pcoa_df %>% left_join(mdata, by = 'sample')
+  }
+  ggp <- plot_pcoa(pcoa_df, axis_x, axis_y, eig_vals, metric_name, color_Var)
+
+}
+```
+
+```{r}
+format_sample_ids <- function(sample_vector){
+  formatted_vector <- sample_vector %>% gsub("\\.","_",.)%>% gsub("-|\\.","_",.) %>% 
+                      gsub("tasmul_|_[0-9].*","",.) %>% gsub("^X", "", .)
+  return(formatted_vector)
+}
+```
+
+```{r fig.height=5, fig.width=8, fig.align='center', message=FALSE}
+bc_dist <- read_delim("qiime/combined/5_Diversity/bray_curtis_distance_matrix_exported/distance-matrix.tsv", 
+                      delim = "\t", escape_double = FALSE, 
+                      trim_ws = TRUE, show_col_types = FALSE) %>% rename(sample_id = ...1)
+colnames(bc_dist) <- format_sample_ids(colnames(bc_dist))
+bc_dist <- bc_dist %>% mutate(sample_id = format_sample_ids(sample_id)) %>% tibble::column_to_rownames('sample_id')
+
+```
+
+```{r fig.height=5, fig.width=8, fig.align='center', message=FALSE}
+ggp <- plot_pcoa_from_dist_mat(bc_dist, "Bray-Curtis", 1, 2, color_Var = "phenotype", mdata = core_mdata)
+ggp + scale_color_manual(values = palette)
+```
+
+
+
+
+```{r}
+ggp <- plot_pcoa_from_dist_mat(bc_dist, "Bray-Curtis", 2,3, color_Var = "phenotype", mdata = core_mdata)
+ggp + scale_color_manual(values = palette)
+```
+
+```{r fig.height=5, fig.width=8, fig.align='center', message=FALSE}
+wu_dist <- read_delim("qiime/combined/5_Diversity/weighted_unifrac_distance_matrix_exported/distance-matrix.tsv", 
+                      delim = "\t", escape_double = FALSE, 
+                      trim_ws = TRUE, show_col_types = FALSE) %>% rename(sample_id = ...1)
+colnames(wu_dist) <- format_sample_ids(colnames(wu_dist))
+wu_dist <- wu_dist %>% mutate(sample_id = format_sample_ids(sample_id)) %>% tibble::column_to_rownames('sample_id')
+
+ggp <- plot_pcoa_from_dist_mat(wu_dist, 'Weighted UniFrac', 1, 2, color_Var = "phenotype", mdata = core_mdata)
+ggp + scale_color_manual(values = palette)
+```
+
+```{r fig.height=5, fig.width=8, fig.align='center', message=FALSE}
+ggp <- plot_pcoa_from_dist_mat(wu_dist, 'Weighted UniFrac',  2,3, color_Var = "phenotype", mdata = core_mdata)
+ggp + scale_color_manual(values = palette)
+```
+
+*** 
+
+## Taxonomy assignment
+
+To assign taxonomy per ASV we used qiime's `feature-classifier` plugin, with SILVA 138 as the reference database. Briefly, we first extracted reads corresponding to the below primers from the reference database, then we train a naive-bayes classifier (using `fit-classifier-naive-bayes`), and lastly we assigned a taxonomy to each ASV in our data using the trained model. The following non-default parameters were used in this process:   
+
+| Parameter                       | Description                                         |
+|---------------------------------|-----------------------------------------------------|
+|`F_PRIMER=CCTACGGGNGGCWGCAG`     | Forward primer used to extract V3-V4 reads          |
+|`R_PRIMER=GACTACHVGGGTATCTAATCC`	| Reverse primer used to extract V3-V4 reads          |  
+|`MIN_AMP_LEN=300`                | Remove extracted sequences shorter than this length |  
+|`MAX_AMP_LEN=600`                | Remove extracted sequences longer than this length  |  
+
+### Unassigned reads
+
+Here we calculate the % of reads per sample for which taxonomy was not assigned, i.e. no match was found in the reference database. We expect these percentages to be low. 
+
+```{r fig.height=3, fig.width=5, fig.align='center'}
+phy_relab <- read_delim("qiime/combined/6_Taxonomy_train_NB/taxa_phylum_table_compo_exported/feature-table.tsv", 
+                        delim = "\t", escape_double = FALSE, 
+                        trim_ws = TRUE, skip = 1, show_col_types = FALSE)
+
+tmp <- phy_relab %>%
+  rename(otu = `#OTU ID`) %>%
+  tidyr::pivot_longer(cols = -otu, names_to = 'sample', values_to = 'relab') %>%
+  filter(otu %in% c("d__Bacteria;__", "Unassigned;__")) %>%
+  group_by(sample) %>%
+  summarise(relab_unassigned_perc = sum(relab), .groups = 'drop')
+
+ggplot(tmp, aes(x = relab_unassigned_perc)) +
+  geom_histogram(color = 'black', fill = 'cadetblue3', bins = 30) +
+  ggtitle('Distribution of % of unassigned reads per sample') +
+  ylab("Samples") +
+  xlab("% of unassigned reads") +
+  scale_x_continuous(labels = scales::percent) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Similarly, here we show the percent of reads succesfully assigned to each taxonomic rank. We note that 16S is considered inefficient in identifying bacteria at the species level or below.
+
+```{r}
+tax_assign <- read_delim("qiime/combined/6_Taxonomy_train_NB/taxonomy_classifications_exported/taxonomy.tsv", 
+                         delim = "\t", escape_double = FALSE, 
+                         trim_ws = TRUE, show_col_types = FALSE)
+names(tax_assign) <- c('asv','full_taxonomy','confidence')
+
+tax_assign <- tax_assign %>%
+  tidyr::separate(col = full_taxonomy, into = c(NA,'p','c','o','f','g','s'), sep = '; ', fill = 'right') %>%
+  # We apply some hard-coded rules to erase uninformative classifications
+  mutate(s = ifelse(grepl('s__unidentified|s__uncultured|s__metagenome|s__human_gut|s__gut_metagenome|s__bacterium_enrichment|s__Bacteroidaceae_bacterium|s__.*_sp\\.|s__.*_bacterium', s),
+                    NA, s)) %>%
+  mutate(g = ifelse(grepl('g__uncultured', g), NA, g)) %>%
+  mutate(f = ifelse(grepl('f__uncultured', f), NA, f)) %>%
+  mutate(o = ifelse(grepl('o__uncultured', o), NA, o)) %>%
+  mutate(c = ifelse(grepl('c__uncultured', c), NA, c)) 
+
+get_asvs_with_rank <- function(tax_rank, tax_assign) {
+  tax_assign %>%
+    filter(!is.na(get({{tax_rank}}))) %>%
+    pull(asv)
+}
+
+tmp <- dada_table %>% tibble::column_to_rownames('#OTU ID')
+totals <- colSums(tmp)
+tax_stats <- bind_rows(
+  data.frame(level = '1-Phylum', perc = colSums(tmp[rownames(tmp) %in% get_asvs_with_rank('p', tax_assign),])*100 / totals),
+  data.frame(level = '2-Class',  perc = colSums(tmp[rownames(tmp) %in% get_asvs_with_rank('c', tax_assign),])*100 / totals),
+  data.frame(level = '3-Order',  perc = colSums(tmp[rownames(tmp) %in% get_asvs_with_rank('o', tax_assign),])*100 / totals),
+  data.frame(level = '4-Family', perc = colSums(tmp[rownames(tmp) %in% get_asvs_with_rank('f', tax_assign),])*100 / totals),
+  data.frame(level = '5-Genus',  perc = colSums(tmp[rownames(tmp) %in% get_asvs_with_rank('g', tax_assign),])*100 / totals),
+  data.frame(level = '6-Species', perc = colSums(tmp[rownames(tmp) %in% get_asvs_with_rank('s', tax_assign),])*100 / totals)
+)  
+```
+
+Each dot corresponds to a single sample.
+
+```{r fig.height=3, fig.width=5, fig.align='center'}
+ggplot(tax_stats, 
+       aes(x = level, y = perc, fill = level)) +
+  geom_boxplot(color = 'black', width = 0.7, outlier.shape = NA) +
+  geom_jitter(alpha = 0.4, size = 1, width = 0.1) +
+  scale_fill_brewer(palette = 'PuBuGn') +
+  ggtitle('Percent of reads assigned to each taxonomic rank') +
+  theme_classic() +
+  ylab('Percent of reads') +
+  xlab(NULL) +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+### Phylum-level taxonomy barplots
+
+Barplots below describe the phyla (or genera) identified in each sample. Rare taxa were grouped together (using a cutoff of mean relative abundance < 0.01) and are collectively named 'Others'. 
+
+```{r}
+# Recieves a compositional feature table and plots stacked barplots per sample 
+plot_taxonomy <- function(relab_df, rare_otu_cutoff = 0.01, plot_title = 'Taxonomy barplots', legend_title = 'Taxon', n_legend_cols = 1) {
+  relab_df <- relab_df %>%
+    rename(otu = 1) %>%
+    tidyr::pivot_longer(cols = -otu, names_to = 'sample', values_to = 'relab') %>%
+    # Re-normalize into relative abundance
+    group_by(sample) %>%
+    mutate(relab = relab / sum(relab)) %>%
+    ungroup()
+    
+  # Group rare otu's together for plot simplicity
+  rare_otus <- relab_df %>%
+    group_by(otu) %>%
+    summarise(mean_relab = mean(relab), .groups = 'drop') %>%
+    filter(mean_relab < rare_otu_cutoff) %>%
+    pull(otu)
+  
+  relab_df <- relab_df %>%
+    mutate(otu_grouped = ifelse(otu %in% rare_otus, 'Others', otu)) %>%
+    group_by(sample, otu_grouped) %>%
+    summarise(relab = sum(relab), .groups = 'drop')
+
+  tmp_palette <- colorRampPalette(RColorBrewer::brewer.pal(9,name = 'RdYlGn'))(n_distinct(relab_df$otu_grouped))
+  ggplot(relab_df, aes(fill = otu_grouped, y = relab, x = sample)) + 
+    geom_bar(position = "fill", stat = "identity", color = 'black') +
+    scale_fill_manual(values = tmp_palette, name = legend_title) +
+    theme_classic() +
+    scale_y_continuous(expand = c(0,0)) +
+    ggtitle(plot_title) +
+    xlab('Sample') +
+    ylab('Relative abundance') +
+    guides(fill = guide_legend(ncol = n_legend_cols)) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 6, hjust = 1)) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(legend.position = "bottom") +
+    theme(legend.direction = "vertical") +
+    theme(legend.text = element_text(size = 9)) +
+    theme(legend.key.size = unit(9, "points"))
+}
+```
+
+```{r fig.height=6, fig.width=10, fig.align='center'}
+plot_taxonomy(phy_relab)
+```
+
+### Genus-level taxonomy barplots
+
+```{r fig.height=8, fig.width=10, fig.align='center'}
+gns_relab <- read_delim("qiime/combined/6_Taxonomy_train_NB/taxa_genus_table_compo_exported/feature-table.tsv", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE, skip = 1, show_col_types = FALSE)
+
+plot_taxonomy(gns_relab)
+```
+
+### Genera prevalence and abundance
+
+Below are the distributions of genera prevalence (% of samples in which each genus was detected) and average abundance (the abundance of each genus is averaged over all samples). These histograms will aid in defining thresholds to discard 'rare genera'.  
+
+
+```{r fig.width=8, fig.height=3, fig.align="center"}
+tmp <- gns_relab %>% tibble::column_to_rownames(var = "#OTU ID")
+genus_frequencies <- data.frame(genus_frequencies = rowSums(tmp > 0)/ncol(tmp))
+
+ggplot(genus_frequencies, aes(x = genus_frequencies)) +
+  geom_histogram(color = 'black', fill = 'cadetblue1', alpha = 0.6, bins = 50) +
+  ggtitle('Distribution of genera prevalence') +
+  xlab("Genus prevalence (% of samples)") +
+  ylab("Number of genera") +
+  scale_x_continuous(expand = c(0,0), labels = scales::percent) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+# Abundance
+genus_avg_abun <- data.frame(genus_avg_abun = rowSums(tmp)/ncol(tmp))
+
+ggplot(genus_avg_abun, aes(x = genus_avg_abun)) +
+  geom_histogram(color = 'black', fill = 'cadetblue1', alpha = 0.6, bins = 100) +
+  ggtitle('Distribution of genera average abundance') +
+  xlab("Genus average abundance (% of reads)") +
+  ylab("Number of genera") +
+  scale_x_continuous(expand = c(0,0), labels = scales::percent) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) 
+```
+
+***
+
+## Pathways predictions using PICRUSt2
+
+```{r fig.height=9, fig.width=10, fig.align='center'}
+pathways <- read_delim("qiime/combined/7_PICRUST2/pathways_out/path_abun_unstrat_descrip.tsv",
+                       delim = "\t",
+                       escape_double = FALSE,
+                       trim_ws = TRUE,
+                       show_col_types = FALSE) %>%
+  select(-1)
+
+plot_taxonomy(pathways, rare_otu_cutoff = 0.008, plot_title = 'Predicted pathways barplots', legend_title = 'Pathway', n_legend_cols = 2)
+```
+
+
+
+

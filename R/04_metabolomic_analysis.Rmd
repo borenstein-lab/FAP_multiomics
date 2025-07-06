@@ -1,0 +1,444 @@
+---
+title: "Metabolomic analysis"
+output: html_notebook
+---
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+theme_set(theme_bw(base_size = 15))
+source("code/R/categorical_metadata_analysis.R")
+source("code/R/visualization.R")
+source("code/R/statistics.R")
+source("code/R/utils.R")
+```
+
+
+```{r}
+data =  read.csv('metabolomics/transformed_df.csv') %>% rename(sample_id = case_number) %>% mutate(sample_id = as.character(sample_id))
+colnames(data) <- gsub("\\.", "_", colnames(data))
+
+compound_names = read.csv('metabolomics/compound_names.csv') %>% select(-X) %>% unique() %>% 
+                 mutate(compound_id = gsub(" |-","_",compound_id),
+                        compound_id = ifelse(grepl("^[0-9]", compound_id), paste0("X", compound_id), compound_id))
+
+compound_list <- setNames(compound_names [[2]], compound_names [[1]])
+```
+
+```{r}
+label_order <- c("Control", "Non-classical FAP", "Classical FAP") %>% rev()
+mdata_all <- read.csv("metadata/clean/core_metadata_with_mean.csv") %>% 
+         #filter(phenotype != "Fatty Liver") %>% 
+         mutate(phenotype = factor(phenotype, levels = label_order),
+                phenotype_binary = ifelse(phenotype %in% c("Classical FAP", "Non-classical FAP"), "FAP", "Control"),
+                gender = ifelse(gender == "Female", 1,0))
+
+fap_cohort_samples <- mdata_all %>% filter(phenotype != "Fatty Liver") %>% pull(sample_id)
+liver_cohort_samples <- mdata_all %>% filter(phenotype_binary != "FAP") %>% pull(sample_id)
+```
+
+```{r}
+sample_intersect <- intersect(data$sample_id, fap_cohort_samples)
+mdata <- mdata_all %>% filter(sample_id %in% sample_intersect)
+data <- data %>% filter(sample_id %in% sample_intersect)
+```
+
+```{r}
+data_long <- data %>% tidyr::pivot_longer(cols = -sample_id, names_to = "compound_id", values_to = "val") %>% 
+  mutate(sample_id = as.character(sample_id)) %>% 
+  left_join(mdata, by = "sample_id") %>% 
+  left_join(compound_names, by = "compound_id") %>% filter(!is.na(phenotype)) %>% 
+  mutate(compund_name = gsub("\\/.*", "", compound_name))
+```
+
+```{r}
+palette_df <- read.csv("metadata/clean/project_palette.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+palette <- setNames(palette_df$color, palette_df$label)
+```
+
+# Analysis of metabolomic data
+## PCA
+
+```{r}
+pca_result <- data %>% tibble::column_to_rownames(var = "sample_id") %>% prcomp(center = F, scale = F)
+pca_df <- pca_result$x %>% as.data.frame() %>% select(PC1, PC2) %>% tibble::rownames_to_column("sample_id") %>% 
+  left_join(mdata, by = "sample_id") %>% filter(!is.na(phenotype))
+var_exp <- (summary(pca_result)$importance[2,][1:2] %>% unname() * 100) %>% round(.,1)
+```
+
+```{r}
+wilcox_test_by_pair(pca_df, "phenotype", "PC1 ~ phenotype", FALSE) %>% add_significance()
+```
+
+```{r, fig.width=6, fig.height=6}
+ggp <- ggplot(pca_df, aes(x = phenotype, y = PC1, color = phenotype, fill = phenotype)) + 
+       geom_boxplot(alpha = 0.3, outlier.shape = "") + 
+    geom_jitter(width = 0.2, size = 2, alpha =0.8)  + 
+       scale_fill_manual(values = palette) + scale_color_manual(values = palette) +
+       labs(x = "Phenotype", y = "PC1") + theme_bw(base_size = 14) + ylim(-30, 20) +
+       theme(legend.position = "none") 
+plot(ggp)
+```
+
+```{r, fig.width=6, fig.height=6}
+ggp <- ggplot(pca_df, aes(x = phenotype, y = PC1, color = is_surgery, fill = is_surgery)) + 
+       geom_boxplot(alpha = 0.3, outlier.shape = "") + 
+    geom_point(position=position_jitterdodge(), alpha = 1, width = 0.2) + 
+       scale_fill_manual(values = palette) + scale_color_manual(values = palette) +
+       labs(x = "Phenotype", y = "PC1", fill = "Surgery", color = "Surgery") + 
+       theme_bw(base_size = 14) + ylim(-30, 20) +theme(legend.position = "top")
+plot(ggp)
+```
+
+```{r, fig.width=8, fig.height=6}
+ggplot(pca_df, aes(PC1, PC2, color = phenotype)) + 
+      geom_point(aes(shape = is_surgery), size = 2, alpha = 0.7) + 
+      labs( x = paste0('Axis PC1 (',var_exp[1], '% variance explained)'),
+             y = paste0('Axis PC2 (',var_exp[2], '% variance explained)'), 
+            shape = "Surgery") +
+      scale_color_manual(values = palette) + theme_bw(base_size = 14)# + theme(legend.position = "none")
+```
+
+```{r}
+pc1 <- pca_result$rotation %>% as.data.frame() %>% select(PC1)  %>% tibble::rownames_to_column("compound_id")  %>% 
+  arrange(desc(abs(PC1))) %>% 
+  mutate(pc1_abs = abs(PC1),
+         pc1_norm = pc1_abs/sum(pc1_abs),
+         weight_cumsum = cumsum(pc1_norm)) %>% left_join(compound_names, by = "compound_id")
+```
+
+
+```{r, fig.height=7, fig.width=21}
+target_comp <- pc1 %>% head(10) %>% pull(compound_id)
+plot_list = list()
+for (comp in target_comp){
+  comp_name = gsub("\\/.*", "", compound_list[comp])
+  ggp <- ggplot(data_long %>% filter(compound_id == comp),
+       aes(x = phenotype, y = val, color = phenotype, fill = phenotype)) + 
+       plot_box_and_jitter(palette, 10) + 
+       labs(x = "Phenotype", y = "Peak Area", subtitle = comp_name) 
+  plot_list <- c(plot_list, list(ggp))
+}
+
+patchwork::wrap_plots(plotlist = plot_list, ncol = 5)
+```
+
+```{r}
+pc1 %>% count(compound_class) %>% arrange(desc(n)) %>% head(10)
+```
+
+```{r}
+clean_metabolite_names <- function(name) {
+  name <- tolower(name)  # Convert to lowercase
+  name <- gsub("/.*", "", name)  # Remove anything after a slash
+  name <- gsub("\\s*\\([^)]*\\)", "", name)  # Remove text in parentheses
+  
+  # Standardize amino acids into a single category
+  amino_acid_terms <- c("amino acid", "amino acids", "amino acid derivative", 
+                         "amino acids, peptides, and analogues")
+  if (name %in% amino_acid_terms) name <- "amino acids"
+  
+  # Convert back to title case
+  name <- tools::toTitleCase(name)
+  
+  return(name)
+}
+
+pc1 <- pc1 %>% mutate(compound_class_clean = sapply(compound_class, clean_metabolite_names))
+```
+
+
+```{r}
+compounds_to_show <- pc1 %>% filter(!is.na(compound_class_clean)) %>%
+                     count(compound_class_clean) %>% filter(n >2) %>% arrange(desc(n)) %>% pull(compound_class_clean)
+ggdata <- pc1%>% filter(compound_class_clean %in% compounds_to_show) %>%
+          mutate(compound_class_clean = factor(compound_class_clean, levels = compounds_to_show))
+ggplot(ggdata, aes(x = reorder(compound_class_clean, PC1) , y = PC1, fill = compound_class_clean, color = compound_class_clean)) + 
+  plot_box_and_jitter() + geom_hline(yintercept = 0, linetype = "dashed") +
+labs(x = "Compound Class", y = "PC1 loading") + coord_flip()
+
+```
+
+
+
+```{r, fig.height=5, fig.width=15}
+compound_classes <- c("Vitamin", "Bile Acids, Alcohols and Derivatives")
+for (target_class in compound_classes){
+target_comp <- ggdata %>% filter(compound_class_clean == target_class) %>% pull(compound_id)
+plot_list = list()
+for (comp in target_comp){
+  comp_name = gsub("\\/.*", "", compound_list[comp])
+  ggp <- ggplot(data_long %>% filter(compound_id == comp),
+       aes(x = phenotype, y = val, color = phenotype, fill = phenotype)) + 
+       plot_box_and_jitter(palette, 10) + 
+       labs(x = "Phenotype", y = "Peak Area", subtitle = comp_name) 
+  plot_list <- c(plot_list, list(ggp))
+}
+
+print(patchwork::wrap_plots(plotlist = plot_list, ncol = 4))
+}
+```
+
+
+
+```{r}
+regressors = c("age", "gender", "bmi")
+metabolites <- colnames(data)[-1]
+p_vals <- c()
+deltas <- c()
+plots <- list()
+ggdata <- data %>% left_join(mdata %>% select(sample_id,phenotype, phenotype_binary, age, gender, bmi), by = "sample_id") %>%
+  mutate(phenotype_binary = factor(phenotype_binary, levels = c("FAP", "Control")))
+
+for (met in metabolites){
+  results <- test_wilcox_residuals(ggdata, regressors, met, "phenotype_binary", show_plots = F)
+  p_vals <- c(p_vals, results[[1]])
+  median_res <- results[[2]]$data %>% group_by(phenotype_binary) %>% summarise(median_res = median(residuals))
+  median_res_delta <- median_res[median_res$phenotype_binary == "Control", 2] - median_res[median_res$phenotype_binary == "FAP", 2]
+  deltas <- c(deltas, median_res_delta)
+  plots[[met]] <- results[[2]]
+}
+wilcox_results <- data.frame(compound_id = metabolites, p_value = p_vals, median_residual_delta = unlist(deltas)) %>%
+  mutate(p_value_adj = p.adjust(p_value, method = "fdr")) %>%
+  arrange(p_value_adj)
+```
+
+```{r}
+volcano_data <- wilcox_results %>% left_join(compound_names, by = "compound_id") %>% 
+  mutate(log_p_value = -log10(p_value_adj),
+         is_enriched = (p_value_adj <  0.1) & abs(median_residual_delta) > 0.5,
+         enrichment_group = ifelse(median_residual_delta > 0 , "Control", "FAP"), 
+         enrichment_group = ifelse(is_enriched, enrichment_group, "Non-significant"),
+         label = ifelse(enrichment_group == "Non-significant", "", compound_name))
+volcano_data %>% head()
+```
+
+```{r, fig.width=5, fig.height=5}
+plot_volcano(volcano_data, y_var = "log_p_value", x_var =  "median_residual_delta",
+             color_var = "enrichment_group", label = "label", coef_min = 0.5) +
+  scale_color_manual(values = palette) + theme(legend.position = "top")+
+  labs(x = "Effect size (Δmedian residuals)",
+       title = "FAP vs Control Metabolites",
+       subtitle = "Corrected for age, BMI and gender")
+```
+```{r}
+target_metabolites <- volcano_data %>% filter(enrichment_group == "FAP") %>% pull(compound_id)
+met_df <- data.frame()
+for (met in target_metabolites){
+  met_df_local <- plots[[met]]$data %>% select(phenotype_binary, residuals) %>% mutate(compound_id = met)
+  met_df <- rbind(met_df, met_df_local)
+}
+met_df <- met_df %>% left_join(compound_names, by = "compound_id")
+```
+
+```{r, fig.width=5, fig.height=5}
+ggplot(met_df, aes(phenotype_binary, residuals, fill = phenotype_binary, color = phenotype_binary)) + 
+  plot_box_and_jitter(palette, 10) + 
+  labs(x = "Phenotype", y = "Residuals",
+       title = "Metabolites enriched in FAP patients", 
+       subtitle = "Corrected for age, BMI and gender") +
+  facet_wrap(~compound_name) +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = palette) +
+  scale_color_manual(values = palette)
+```
+```{r}
+a <- ggdata %>% select(sample_id, phenotype_binary, target_metabolites) %>% 
+  tidyr::pivot_longer(cols = target_metabolites, names_to = "compound_id", values_to = "peak") %>% 
+  left_join(compound_names, by = "compound_id")
+
+a %>% group_by(compound_id) %>% wilcox.test()
+
+ggplot(a, aes(phenotype_binary, peak, fill = phenotype_binary, color = phenotype_binary)) + 
+  plot_box_and_jitter(palette, 10) + 
+  labs(x = "Phenotype", y = "Peak Area",
+       title = "Metabolites enriched in FAP patients") +
+  facet_wrap(~compound_name) +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = palette) +
+  scale_color_manual(values = palette)
+```
+
+
+
+```{r}
+target_metabolites <- volcano_data %>% filter(enrichment_group == "Control") %>% arrange(desc(median_residual_delta))
+met_df <- data.frame()
+for (met in target_metabolites$compound_id){
+  met_df_local <- plots[[met]]$data %>% select(phenotype_binary, residuals) %>% mutate(compound_id = met)
+  met_df <- rbind(met_df, met_df_local)
+}
+met_df <- met_df %>% left_join(compound_names, by = "compound_id") %>% mutate(compound_name = factor(compound_name, levels = target_metabolites$compound_name))
+```
+
+```{r, fig.width=15, fig.height=15}
+ggplot(met_df, aes(phenotype_binary, residuals, fill = phenotype_binary, color = phenotype_binary)) + 
+  plot_box_and_jitter(palette, 10) + 
+  labs(x = "Phenotype", y = "Residuals",
+       title = "Metabolites enriched in FAP patients", 
+       subtitle = "Corrected for age, BMI and gender") +
+  theme(legend.position = "none")  + facet_wrap(~compound_name, ncol = 9) + 
+  scale_fill_manual(values = palette) +scale_color_manual(values = palette)
+```
+
+
+## Data preparation for pathway enrichment analysis
+```{r}
+hmdb <- read.csv("metabolomics/external_data/hmdb_compound_id_to_name.tsv", sep = "\t")
+hmdb_main <- hmdb %>% select(-synonyms) %>% rename(compound_name = name)
+hmdb_synonyms <- hmdb %>% select(-name) %>% tidyr::separate_rows(synonyms, sep = "; ") %>% rename(compound_name = synonyms) %>% 
+                 mutate(compound_name = trimws(compound_name))
+```
+
+```{r}
+kegg <- read.delim("metabolomics/external_data/cmp_to_name.txt", header = FALSE,
+                   col.names = c("kegg_id", "compound_name"), stringsAsFactors = FALSE) %>% 
+                   tidyr::separate_rows(compound_name, sep = "; ") %>% 
+                   mutate(compound_name = trimws(compound_name))
+```
+
+In order to perform pathway enrichment, the compound IDs need to be matched to KEGG compound IDs (done by name since there is no conversion key)
+```{r}
+greek_to_english <- c(
+  "α" = "alpha", "β" = "beta", "γ" = "gamma", "δ" = "delta", "ε" = "epsilon",
+  "ζ" = "zeta", "η" = "eta", "θ" = "theta", "ι" = "iota", "κ" = "kappa",
+  "λ" = "lambda", "μ" = "mu", "ν" = "nu", "ξ" = "xi", "ο" = "omicron",
+  "π" = "pi", "ρ" = "rho", "σ" = "sigma", "τ" = "tau", "υ" = "upsilon",
+  "φ" = "phi", "χ" = "chi", "ψ" = "psi", "ω" = "omega"
+)
+# Split names into a single name per row (multiple naming options exist for some metabolites)
+cmp <- volcano_data %>% select(compound_id, compound_name) %>% 
+       tidyr::separate_rows(compound_name, sep = "/") %>% 
+       mutate(compound_name = trimws(compound_name)) 
+cmp$compound_name <- stringr::str_replace_all(cmp$compound_name, greek_to_english) # translate Greek letters to English 
+```
+
+```{r}
+# try to match compound names to KEGG data (name to KEGG ID)
+cmp <- cmp %>% left_join(kegg, by = "compound_name")
+matched_compounds <- cmp %>% filter(!is.na(kegg_id)) %>% select(-compound_name) %>% unique()# 192 of the metabolites have 1 KEGG ID, 11 have multiple KEGG IDs
+unmatched_compounds <- cmp %>% filter(is.na(kegg_id), !compound_id %in% matched_compounds$compound_id) %>% select(-kegg_id)
+
+# for those that have a KEGG ID, get the HMDB ID for the main compound id or its synonyms
+## Try to match to HMDB main metabolite name
+cmp_main <- unmatched_compounds %>% left_join(hmdb_main, by = "compound_name") %>% filter(!is.na(accession)) # 35 metabolites matched to HMDB main names (only 18 have KEGG IDs)
+matched_compounds <- rbind(matched_compounds, cmp_main %>% select(compound_id, kegg_id))
+unmatched_compounds <- unmatched_compounds %>% filter(!compound_id %in% matched_compounds$compound_id)
+
+## Try to match to HMDB synonymic metabolite names
+cmp_synonyms <- unmatched_compounds %>% left_join(hmdb_synonyms, by = "compound_name") %>% filter(!is.na(accession))
+matched_compounds <- rbind(matched_compounds, cmp_synonyms %>% select(compound_id, kegg_id)) # 32 metabolites matched to HMDB synonyms (only 25 have KEGG IDs)
+
+unmatched_compounds <- unmatched_compounds %>% filter(!compound_id %in% matched_compounds$compound_id) # 56 metabolites remain without KEGG or HMDB IDs
+#cat(unmatched_compounds$compound_name, sep = "\n") # these metabolites were searched using the tool metaboanalyst and results were manually validated using PubChem
+
+manual_matches <- read.csv("metabolomics/external_data/manual_compound_search_metaboanalyst.csv") %>% 
+                  left_join(cmp %>% select(compound_id, compound_name) %>% unique(), by = "compound_name")
+unmatched_compounds <- manual_matches %>% filter(is.na(kegg_id)) # 38 compounds remain unmatched out of 316
+                       
+matched_compounds <- rbind(matched_compounds, manual_matches %>% filter(!is.na(kegg_id)) %>% select(compound_id, kegg_id) %>% unique()) %>% 
+                     filter(kegg_id != "")
+```
+
+```{r}
+parse_pathway_names <- function(file_path) {
+  lines <- readLines(file_path)
+  current_parent_category <- NULL
+  current_category <- NULL
+  result_list <- list()
+
+  for (line in lines) {
+    line <- trimws(line)
+    if (line == "") {
+      next  # skip empty lines and lines with single #
+    }
+    if (grepl("^#", line) & !grepl("^##", line)){
+      current_parent_category <- sub("^#", "", line)
+    }
+    if (startsWith(line, "##")) {
+      current_category <- sub("^##", "", line)
+    } else {
+      split_line <- strsplit(line, "\t")[[1]]
+      if (length(split_line) == 2 && !is.null(current_category)) {
+        result_list[[length(result_list) + 1]] <- data.frame(
+          pathway_id = split_line[1],
+          pathway_name = split_line[2],
+          parent_category = current_parent_category,
+          category = current_category,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+
+  result_df <- do.call(rbind, result_list)
+  return(result_df)
+}
+
+```
+
+```{r}
+pathways <- read.delim("metabolomics/external_data/pathway_compound.list", header = FALSE,
+                       col.names = c("pathway_id", "kegg_id"), stringsAsFactors = FALSE) %>%
+            mutate(kegg_id = gsub("cpd:","", kegg_id), pathway_id = gsub("path:map","", pathway_id))
+
+file_path = "metabolomics/external_data/pathways.list"
+pathway_names <- parse_pathway_names(file_path)
+pathways <- pathways %>% left_join(pathway_names, by = "pathway_id")
+
+target_pathways <- pathways %>% filter(kegg_id %in% matched_compounds$kegg_id) %>% 
+                 count(pathway_id) %>% filter(n>= 3) %>% pull(pathway_id)
+pathways_filt <- pathways %>% filter(pathway_id %in% target_pathways)
+
+#write.csv(matched_compounds, "processed_data/compound_id_to_ko.csv", row.names = FALSE)
+#write.csv(pathways, "processed_data/pathways_annotated.csv", row.names = FALSE)
+```
+
+
+## Pathway enrichment
+
+```{r}
+df <- volcano_data %>% left_join(matched_compounds, by = "compound_id") %>% arrange(desc(median_residual_delta)) %>% filter(!is.na(kegg_id))
+ranked_vec <- df$median_residual_delta
+names(ranked_vec) <- df$kegg_id
+
+pathway_list <- pathways_filt %>%
+  group_by(pathway_name) %>%
+  summarise(compounds = list(unique(kegg_id))) %>%
+  deframe()  #
+```
+
+
+```{r}
+fgsea_res <- fgsea::fgsea(pathways = pathway_list, stats = ranked_vec)
+fgsea_res <- fgsea_res[order(fgsea_res$pval), ] %>% left_join(pathway_names, by = c("pathway" = "pathway_name"))
+```
+Transform leadingEdge from compound_id to name
+```{r}
+compound_id_to_name <- df$compound_name
+names(compound_id_to_name) <- df$kegg_id
+
+translate_and_paste_compounds <- function(x){
+ compound_id_to_name[x] %>% unname() %>% trimws() %>%
+ sort() %>% paste(., collapse = ", ")
+}
+
+fgsea_res$leadingEdge_names <- lapply(fgsea_res$leadingEdge,  translate_and_paste_compounds) 
+```
+
+
+```{r}
+ggplot(fgsea_res %>% filter(pval < 0.05), aes(x = reorder(pathway, NES), y = NES, fill = category)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Pathway Enrichment Analysis",
+       x = "Pathway",
+       y = "Normalized Enrichment Score (NES)") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+
+

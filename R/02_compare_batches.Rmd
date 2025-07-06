@@ -1,0 +1,424 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+```{r}
+library(ggplot2)
+library(dplyr)
+source("code/R/utils.R")
+source("code/R/visualization.R")
+theme_set(theme_bw(base_size = 15))
+```
+
+## Imports
+### palette and metadata
+```{r}
+palette_df <- read.csv("metadata/clean/project_palette.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+palette <- palette_df$color
+names(palette) <- palette_df$label
+```
+
+```{r}
+sample_metadata <- read.csv("metadata/clean/metadata_combined.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+core_mdata_cols <- c("patient_id","sample_id", "phenotype", "batch", "is_surgery","surgery_type" ,  "bmi",
+                     "gender","age","phenotype", "is_current_smoker", "is_ever_smoker")
+core_mdata <- sample_metadata %>% select(all_of(core_mdata_cols)) %>% #rename(sample = sample_id) %>%
+              mutate(phenotype = factor(phenotype, levels = c("Classical FAP", "Non-classical FAP","Fatty Liver","Control" )),
+                     is_fap = phenotype %in% c("Classical FAP", "Non-classical FAP"))
+```
+
+
+### genus distance matrix
+
+```{r}
+path <- paste0("qiime/combined/6_Taxonomy_GTDB/feature_table.tsv")
+relab<- read.table(path , header = TRUE, sep = "\t")
+genus_norm <- relab %>% filter(stringr::str_detect(taxon , ";g__.+", )) %>%
+               tibble::column_to_rownames("taxon") %>%  mutate_all(~ . / sum(.))
+colnames(genus_norm) <- format_sample_ids(colnames(genus_norm))
+```
+
+```{r}
+fap_samples <- core_mdata %>% filter(is_fap) %>% pull(sample_id)
+non_fap_samples <-  setdiff(colnames(genus_norm), fap_samples)
+genus_norm_non_fap <- genus_norm %>% select(non_fap_samples)
+```
+
+```{r}
+fatty_liver_samples <- core_mdata %>% filter(phenotype == "Fatty Liver") %>% pull(sample_id)
+non_fatty_liver_samples <-  setdiff(colnames(genus_norm), fatty_liver_samples)
+genus_norm <- genus_norm %>% select(non_fatty_liver_samples)
+```
+
+## Functions
+plot PCoA plots, colored by (a) phenotype and (b) highlighting pairs of samples belonging to the same patient
+```{r}
+plot_pcoa_2d <- function(dist_df, core_mdata, palette,  x_var = 1, y_var =2,
+                         shape_var = "batch", dist_metric = ""){
+  pcoa_df <- get_pcoa(dist_df, 2)
+  eig_vals <- pcoa_df[[1]]
+  pcoa_df <- pcoa_df[[2]] %>% left_join(core_mdata, by = "sample_id")
+  
+  multi_sample_patient = pcoa_df %>% count(patient_id) %>% filter(n>1) %>% pull(patient_id)
+  pcoa_df <- pcoa_df %>% mutate(patient_cat = ifelse(patient_id %in% multi_sample_patient, patient_id, "single_sample"))
+  # Plot PCs 1 and 2 by phenotype
+  ggp <- ggplot(pcoa_df,aes_string(paste0("axis_", x_var), paste0("axis_", y_var), color = "phenotype", shape = shape_var)) +
+      geom_point(size = 2, alpha = 0.7) + 
+     ggtitle(paste0('PCoA ',dist_metric,'(Axes ',x_var,' vs. ',y_var,')')) +
+      xlab(paste0('Axis ',x_var,' (', eig_vals[x_var], '% variance explained)')) +
+      ylab(paste0('Axis ',y_var,' (', eig_vals[y_var], '% variance explained)')) +
+      theme_classic() +
+      theme(plot.title = element_text(hjust = 0.5)) + 
+      scale_color_manual(values = palette) 
+  plot(ggp)
+  
+  
+  # Plot PCs 1 and 2 by patient and batch
+  ggp <- ggplot(pcoa_df,aes_string(paste0("axis_", x_var), paste0("axis_", y_var), color = "patient_cat", group = "patient_cat", shape = shape_var)) +
+      geom_point(data = pcoa_df %>% filter(patient_cat == "single_sample"), size = 3, alpha = 0.5, color = "grey") +
+      geom_point(data = pcoa_df %>% filter(patient_cat != "single_sample"), size = 3, alpha = 0.7) + 
+      geom_line(data = pcoa_df %>% filter(patient_cat != "single_sample")) + 
+      ggtitle(paste0('PCoA ',dist_metric,'(Axes ',x_var,' vs. ',y_var,')')) +
+      xlab(paste0('Axis ',x_var,' (', eig_vals[x_var], '% variance explained)')) +
+      ylab(paste0('Axis ',y_var,' (', eig_vals[y_var], '% variance explained)')) +
+      theme_classic() +
+      theme(plot.title = element_text(hjust = 0.5))
+  plot(ggp)
+  
+  return(pcoa_df)
+}
+```
+
+## Analysis
+### Sample PCoA plots of all genera, based on Bray-Curtis dissimilarity.
+Plot the metagenomic samples according to their phenotype (indication + severity) and batch (sequencing run).
+Samples with similar taxonomic profiles should be close to each other in this plot. 
+
+
+```{r}
+genus_dist <- vegan::vegdist(genus_norm %>% t(), method = "bray") %>% as.matrix()
+pcoa_df <- plot_pcoa_2d(genus_dist,core_mdata, palette, dist_metric = "Bray-Curtis")
+```
+
+
+
+### Process samples with more than one sample per patient
+Calculate the mean relative abundance of each genus for each patient (effects only patients which have more than one sample).
+```{r}
+calculate_patient_mean <- function(pcoa_df, data){
+  sample_map <- pcoa_df %>% filter(patient_cat != "single_sample") %>% select(sample_id, patient_id, batch) 
+patient_data <- data %>% select(all_of(sample_map$sample_id)) %>% t() %>% as.data.frame() %>% 
+                    tibble::rownames_to_column("sample_id") %>%
+                    tidyr::pivot_longer(cols = -sample_id, names_to = "name", values_to = "val") %>%
+                    left_join(sample_map, by = "sample_id")
+patient_data_mean <- patient_data %>% group_by(patient_id, name) %>% summarise(mean_val= mean(val)) %>%
+                         mutate(patient_id = paste0(patient_id,"_mean")) %>%  ungroup()
+patient_data_mean_wide <- patient_data_mean %>% tidyr::spread(name, mean_val) %>% 
+                              tibble::column_to_rownames("patient_id") %>% t() %>% as.data.frame()
+return (patient_data_mean_wide)
+}
+```
+
+```{r}
+sample_map <- pcoa_df %>% filter(patient_cat != "single_sample") %>% select(sample_id, patient_id, batch) 
+patient_genus <- genus_norm %>% select(all_of(sample_map$sample_id)) %>% t() %>% as.data.frame() %>% 
+                    tibble::rownames_to_column("sample_id") %>%
+                    tidyr::pivot_longer(cols = -sample_id, names_to = "genus", values_to = "ra") %>%
+                    left_join(sample_map, by = "sample_id")
+patient_genus_ra_mean <- patient_genus %>% group_by(patient_id, genus) %>% summarise(mean_ra = mean(ra)) %>%
+                         mutate(patient_id = paste0(patient_id,"_mean")) %>%  ungroup()
+patient_genus_ra_mean_wide <- patient_genus_ra_mean %>% tidyr::spread(genus, mean_ra) %>% 
+                              tibble::column_to_rownames("patient_id") %>% t() %>% as.data.frame()
+```
+### Plot the relative abunance Spearman correlation between samples of the same patient in different batches 
+```{r}
+manual_corr_calc_for_plot <- function(df){
+    person_corr_lab <- df %>% group_by(patient_id) %>% 
+                       summarise(cor_test = list(cor.test(`Batch 22`, `Batch 24`, method = "spearman")),.groups = "drop") %>%
+                        mutate( r = sapply(cor_test, function(x) x$estimate),
+                                r = paste("R =", round(r, 2)),
+                                pval = sapply(cor_test, function(x) x$p.value),
+                                fdr = p.adjust(pval, method = "fdr"),
+                                p_string = ifelse( fdr < 2.2e-16, "p < 2.2e-16",
+                                                   paste0("p = ",
+                                                   formatC(fdr, format = "e", digits = 2))),
+                                label = paste0(r, "\n", p_string)) %>%
+                      select(patient_id, label) %>% unique()
+    return (person_corr_lab)
+}
+```
+
+
+```{r, fig.width=12, fig.height=10}
+ggdata <- patient_genus %>% select(-sample_id) %>%  tidyr::pivot_wider(names_from = batch, values_from = ra) 
+person_corr_lab <- manual_corr_calc_for_plot(ggdata)
+
+ggp <- ggplot(ggdata, aes(x = `Batch 22`, y = `Batch 24`)) + geom_point() + 
+       geom_abline(intercept = 0, slope = 1) + 
+       scale_x_log10() + scale_y_log10() +
+       facet_wrap(~patient_id, scales = "free") + 
+        geom_text(data = person_corr_lab, 
+            aes(x = 0.004, y = 0.00001, label = label),
+            hjust = 0, vjust = 0, size = 3, inherit.aes = FALSE) +
+       theme_bw(base_size = 12)
+plot(ggp)
+```
+### Create relative abundance and metadata dataframes with the mean samples
+```{r}
+genus_ra_with_mean <- genus_norm %>% tibble::rownames_to_column("genus") %>% 
+                      left_join(patient_genus_ra_mean_wide %>% tibble::rownames_to_column("genus") , by = "genus") %>% 
+                      tibble::column_to_rownames("genus")
+
+core_mdata_mean_samples <- data.frame(sample_id = colnames(patient_genus_ra_mean_wide)) %>% 
+                           mutate(patient_id = gsub("_mean", "", sample_id), 
+                                  batch = "Mean RA") %>%
+                           left_join(core_mdata %>% select(-sample_id, -batch) %>% unique(), by = "patient_id")
+core_mdata_with_mean <- rbind(core_mdata, core_mdata_mean_samples)
+```
+
+### Visualize the new PCoA plot with the mean samples
+PCoA is a distance takes in accont the distances between all samples, so the mean samples should fall around (but not nessecarily exactly in) the middle of the samples of the same patient.
+```{r}
+genus_dist <- vegan::vegdist(genus_ra_with_mean %>% t(), method = "bray") %>% as.matrix()
+pcoa_df <- plot_pcoa_2d(genus_dist,core_mdata_with_mean, palette)
+```
+
+### Plot PCoA with only one sample per patient (single samples and mean samples)
+```{r}
+cross_batch_samples <- pcoa_df %>% filter((patient_cat != "single_sample") & (batch != "Mean RA")) %>% pull(sample_id)
+genus_ra_only_mean <- genus_ra_with_mean %>% select(-cross_batch_samples) 
+pcoa_df <- plot_pcoa_2d(genus_ra_only_mean %>% t() %>% 
+                      vegan::vegdist(method = "bray") %>% as.matrix(), core_mdata_with_mean, palette)
+```
+
+
+### Filter out rare genera and plot the PCoA
+```{r}
+genus_ra_only_mean_filt <- remove_rare_features(t(genus_ra_only_mean),
+                                                prevalence_cutoff = 0.1,
+                                                avg_abundance_cutoff = 0.001,
+                                                rescale = T) %>% t() %>% as.data.frame()
+ggdata <- genus_ra_only_mean_filt  %>% t() %>% vegan::vegdist(method = "bray") %>% as.matrix()
+pcoa_df <- plot_pcoa_2d(ggdata, core_mdata_with_mean, palette)
+pcoa_df <- plot_pcoa_2d(ggdata, core_mdata_with_mean, palette, shape_var = "is_surgery")
+```
+
+```{r, fig.width=12, fig.height=10}
+ggdata <- patient_genus %>% select(-sample_id) %>% filter(genus %in% rownames(genus_ra_only_mean_filt)) %>% 
+          group_by(patient_id, batch) %>% mutate(ra = ra/sum(ra)) %>% ungroup() %>% 
+          tidyr::pivot_wider(names_from = batch, values_from = ra)
+
+person_corr_lab <- manual_corr_calc_for_plot(ggdata)
+
+ggp <- ggplot(ggdata, aes(x = `Batch 22`, y = `Batch 24`)) + geom_point() + 
+       geom_abline(intercept = 0, slope = 1) + 
+       scale_x_log10() + scale_y_log10() +
+       facet_wrap(~patient_id, scales = "free") + 
+        geom_text(data = person_corr_lab, 
+            aes(x = 0.004, y = 0.00001, label = label),
+            hjust = 0, vjust = 0, size = 3, inherit.aes = FALSE) +
+       theme_bw(base_size = 12)
+plot(ggp)
+```
+
+
+
+### Calculate statistics between phenotype groups based on PC1
+
+```{r}
+wilcox_test_by_pair(pcoa_df, "phenotype", "axis_1 ~ phenotype")
+```
+
+```{r, fig.width=6, fig.height=6}
+ggp <- ggplot(pcoa_df, aes(x = phenotype, y = axis_1, color = phenotype, fill = phenotype)) + 
+       plot_box_and_jitter(palette, 14) + 
+       labs(x = "Phenotype", y = "PC1")  + ylim(-0.35, 0.65)  # change ylim to have enough space for significance starts
+plot(ggp)
+```
+
+## Data export
+
+```{r}
+genus_ra_only_mean <-  genus_ra_only_mean %>% t() %>% as.data.frame() %>% tibble::rownames_to_column("sample_id")
+genus_ra_only_mean_filt <-  genus_ra_only_mean_filt %>% t() %>% as.data.frame() %>% tibble::rownames_to_column("sample_id")
+```
+
+```{r}
+genus_ra_pre_batch_fix <- genus_norm %>% t() %>% as.data.frame() %>% tibble::rownames_to_column("sample_id")
+genus_ra_pre_batch_fix_filt <- genus_ra_pre_batch_fix %>% select(all_of(colnames(genus_ra_only_mean_filt)))
+```
+
+
+```{r}
+# write.csv(core_mdata_with_mean, "metadata/clean/core_metadata_with_mean.csv", row.names = FALSE)
+# 
+# write.csv(genus_ra_pre_batch_fix, "processed_data/genus_ra_pre_batch_merge.csv", row.names = FALSE)
+# write.csv(genus_ra_pre_batch_fix_filt, "processed_data/genus_ra_pre_batch_merge_non_rare.csv", row.names = FALSE)
+# 
+# write.csv(genus_ra_only_mean, "processed_data/genus_ra_all.csv", row.names = FALSE)
+# write.csv(genus_ra_only_mean_filt, "processed_data/genus_ra_non_rare.csv", row.names = FALSE)
+```
+
+# Functional results
+
+```{r}
+metadata <- sample_metadata %>% filter(phenotype != "Fatty Liver") 
+pathways <- read.delim("qiime/combined/7_PICRUST2/pathways_out/path_abun_unstrat_descrip.tsv", sep ="\t", header = T) %>%
+            mutate(pathway = gsub("-","_", pathway))
+pathway_meaning <- pathways %>% select(pathway,description)
+pathway_meaning_list = c(pathway_meaning$description)
+names(pathway_meaning_list) = pathway_meaning$pathway
+
+pathways <- pathways %>% select(-description) %>% tibble::column_to_rownames("pathway")
+colnames(pathways) <- format_sample_ids(colnames(pathways))
+
+shared_samples <-dplyr::intersect(metadata$sample_id, colnames(pathways))
+metadata <- metadata %>% filter(sample_id %in% shared_samples)
+pathways <- pathways %>% select(all_of(shared_samples)) #%>% scale(center = TRUE, scale = TRUE) %>% as.data.frame()
+pathways <- sweep(pathways, 2, colSums(pathways), FUN = "/") # calculate relative abundance
+```
+
+
+```{r}
+pathways_dist <- pathways %>% t() %>%  dist(.,method = "euclidean") %>% as.matrix()
+pcoa_df <- plot_pcoa_2d(pathways_dist,core_mdata, palette)
+```
+### Create relative abundance and metadata dataframes with the mean samples
+
+```{r}
+patient_pw <- pathways %>% select(all_of(sample_map$sample_id)) %>% t() %>% as.data.frame() %>% 
+                    tibble::rownames_to_column("sample_id") %>%
+                    tidyr::pivot_longer(cols = -sample_id, names_to = "pathway", values_to = "ra") %>%
+                    left_join(sample_map, by = "sample_id")
+
+patient_pw_ra_mean <- patient_pw %>% group_by(patient_id, pathway) %>% summarise(mean_ra = mean(ra)) %>%
+                         mutate(patient_id = paste0(patient_id,"_mean")) %>%  ungroup()
+patient_pw_ra_mean_wide <- patient_pw_ra_mean %>% tidyr::spread(pathway, mean_ra) %>% 
+                              tibble::column_to_rownames("patient_id") %>% t() %>% as.data.frame()
+
+pathway_ra_with_mean <- pathways %>% tibble::rownames_to_column("pathway") %>% 
+                      left_join(patient_pw_ra_mean_wide %>% tibble::rownames_to_column("pathway") , by = "pathway") %>% 
+                      tibble::column_to_rownames("pathway")
+```
+```{r}
+pathway_dist <-pathway_ra_with_mean %>% t() %>% dist(.,method = "euclidean") %>% as.matrix()
+pcoa_df <- plot_pcoa_2d(pathway_dist,core_mdata_with_mean, palette)
+```
+
+
+```{r, fig.width=12, fig.height=10}
+ggdata <- patient_pw %>% select(-sample_id) %>% 
+          tidyr::pivot_wider(names_from = batch, values_from = ra)
+
+person_corr_lab <- manual_corr_calc_for_plot(ggdata)
+
+ggp <- ggplot(ggdata, aes(x = `Batch 22`, y = `Batch 24`)) + geom_point() + 
+       geom_abline(intercept = 0, slope = 1) + 
+       facet_wrap(~patient_id, ) + 
+      geom_text(data = person_corr_lab,
+            aes(y = 0.0025, x =0.01, label = label),
+            hjust = 0, vjust = 0, size = 3, inherit.aes = FALSE) +
+       theme_bw(base_size = 12)
+plot(ggp)
+```
+
+On one hand, functional profiles of the same patient across batches are very strongly correlated (R = 0.97) 
+with no clear bias towards one of the batches. On the other hand, for some patients batch correcting the data would cause major shift is the PCoA space. 
+In addition, the two remaining patients which are unique to batch 24 are located in the same area of the PCoA space as the rest of the FAP patients, so they do not seem to be outliers.
+As a result, I decided to use the data from batch 22 (when available) because this is the larger batch, and use the new samples from batch 24 as they are. 
+
+```{r}
+batch_22_samples <- metadata %>% filter(batch == "Batch 22") %>% pull(sample_id)
+batch_24_samples_to_keep <- metadata %>% filter(batch == "Batch 24", !sample_id %in% sample_map$sample_id) %>% pull(sample_id)
+samples_to_keep <- c(batch_22_samples, batch_24_samples_to_keep)
+pathways <- pathways %>% select(all_of(samples_to_keep))
+```
+
+```{r}
+ggdata <- rowSums(pathways > 0) %>% as.data.frame() %>% rename("n" = ".")
+ggplot(ggdata, aes(n)) + 
+geom_histogram(alpha = 0.7) + 
+geom_vline(xintercept = 0.1 * ncol(pathways), linetype = "dashed", color = "black") + 
+theme_classic() + 
+labs(x = "# samples", t = "# Pathways", title = "Pathway prevalance", subtitle = "Distribution of pathways across samples") 
+```
+
+```{r}
+ggdata <-  rowSums(pathways)/ ncol(pathways)
+ggdata <- ggdata %>% as.data.frame() %>% rename("mean_abun" = ".")
+
+ggplot(ggdata, aes(100* mean_abun)) + 
+geom_histogram(alpha = 0.7, bins = 100) + 
+geom_vline(xintercept = 0.05, linetype = "dashed", color = "black") + 
+theme_classic() + 
+labs(x = "% Mean abundance", y = "# Pathways", title = "Pathway mean abundance", subtitle = "Distribution of pathways across samples") 
+
+```
+
+```{r}
+pathways_filt <- remove_rare_features(pathways %>% t(), 
+                                 prevalence_cutoff = 0.1, 
+                                 avg_abundance_cutoff = 0.0005) %>% t() %>% as.data.frame()
+pathways_filt <- sweep(pathways_filt, 2, colSums(pathways_filt), FUN = "/") # calculate relative abundance
+colSums(pathways_filt)
+```
+
+
+
+```{r}
+pathway_dist <- pathways_filt %>% t() %>% dist(.,method = "euclidean") %>% as.matrix()
+pcoa_df <- plot_pcoa_2d(pathway_dist,core_mdata_with_mean, palette)
+write.csv(pathways_filt %>% tibble::rownames_to_column("pathway"), "processed_data/pathways.csv", row.names = F)
+#write.csv(pathway_meaning, "processed_data/pathway_meanings.csv")
+```
+## Fatty liver vs Control
+
+
+```{r}
+pcoa_df <- plot_pcoa_2d(genus_norm_non_fap,core_mdata, palette)
+```
+
+
+
+```{r, fig.width=4, fig.height=4}
+wilcox_all <- data.frame()
+for (i in c(1:2)){
+  wilcox_i <- wilcox_test_by_pair(pcoa_df, "phenotype", paste0("axis_",i," ~ phenotype"), FALSE)
+  ggp <- ggplot(pcoa_df, aes_string(x = "phenotype", y = paste0("axis_", i), color = "phenotype", fill = "phenotype")) + 
+         plot_box_and_jitter(palette) + 
+         labs(x = "Phenotype", y = paste0("PC",i))
+  plot(ggp)
+  wilcox_all <- rbind(wilcox_all, wilcox_i)
+}
+wilcox_all %>% add_significance()
+```
+
+```{r}
+genus_ra_only_mean_filt <- remove_rare_features(t(genus_norm_non_fap),
+                                                prevalence_cutoff = 0.1,
+                                                avg_abundance_cutoff = 0.001,
+                                                rescale = T) %>% t() %>% as.data.frame()
+
+#write.csv(genus_ra_only_mean_filt, "processed_data/genus_ra_non_rare_fatty_liver.csv", row.names = FALSE)
+
+pcoa_df <- plot_pcoa_2d(genus_ra_only_mean_filt, core_mdata_with_mean, palette)
+```
+```{r}
+genus_ra_only_mean_filt %>% head()
+```
+
+
+```{r, fig.width=4, fig.height=4}
+wilcox_all <- data.frame()
+for (i in c(1:2)){
+  wilcox_i <- wilcox_test_by_pair(pcoa_df, "phenotype", paste0("axis_",i," ~ phenotype"), FALSE)
+  ggp <- ggplot(pcoa_df, aes_string(x = "phenotype", y = paste0("axis_", i), color = "phenotype", fill = "phenotype")) + 
+         plot_box_and_jitter(palette) + 
+         labs(x = "Phenotype", y = paste0("PC",i))
+  plot(ggp)
+  wilcox_all <- rbind(wilcox_all, wilcox_i)
+}
+wilcox_all %>% add_significance()
+```

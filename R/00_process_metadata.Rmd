@@ -1,0 +1,165 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(dplyr)
+getwd()
+```
+
+```{r}
+mdata_prospective_path = "metadata/clean/metadata_prospective.csv"
+mdata_prospective = read.csv(mdata_prospective_path, header = TRUE, sep = ",", stringsAsFactors = FALSE)
+colnames(mdata_prospective) = mdata_prospective %>% colnames() %>% tolower() %>% gsub("_[0-9].*|_laura","",.)
+mdata_prospective <- mdata_prospective %>% mutate(surgery_type = "No surgery", 
+                                                  phenotype = ifelse(is_fatty_liver, "Fatty Liver", "Control"),
+                                                  cohort = "Prospective Cohort")
+```
+
+```{r}
+mdata_fap_path = "metadata/clean/metadata_fap.csv"
+mdata_fap = read.csv(mdata_fap_path, header = TRUE, sep = ",", stringsAsFactors = FALSE)
+colnames(mdata_fap) = mdata_fap %>% colnames() %>% tolower() %>% gsub("_[0-9].*","",.)
+mdata_fap <- mdata_fap %>% mutate(colonoscopy_classification = 5,
+                                  cohort = "FAP Cohort",
+                                  phenotype = ifelse(phenotype == 1, "Classical FAP", "Non-classical FAP"),
+                                  surgery_type = case_when(surgery_type == 1 ~ "Pouch",
+                                                           surgery_type == 2 ~ "Subtotal colectomy",
+                                                           TRUE ~ "No surgery"))
+```
+
+```{r}
+colono_groups_path <- "metadata/clean/sample_summary.csv"
+colono_groups <- read.csv(colono_groups_path, header = TRUE,
+                          sep = ",", stringsAsFactors = FALSE) %>% select(-n)
+```
+
+```{r}
+shared_cols = intersect(colnames(mdata_fap), colnames(mdata_prospective))
+mdata = rbind(mdata_prospective[shared_cols], mdata_fap[shared_cols]) %>% 
+        left_join(colono_groups, by = c("colonoscopy_classification" = "group_id")) %>% 
+        mutate(gender = ifelse(gender == 0, "Female", "Male"),
+               case_number = as.character(case_number),
+               patient_id = paste(track_number, cohort, sep = "_"))
+```
+
+```{r}
+mdata <- mdata %>% select(patient_id, case_number, sigma_id) %>% 
+          tidyr::pivot_longer(cols = -patient_id, names_to = "sample_source", values_to = "sample_id") %>%
+          left_join(mdata %>% select(-case_number, -sigma_id), by = "patient_id") %>% 
+          mutate(batch = ifelse(sample_source == "sigma_id", "Batch 22", "Batch 24"),
+                 is_surgery = surgery_type != "No surgery")
+
+mdata <- mdata %>% filter(!sample_id %in% c(0, "35808028", NA)) # sample_id 0 is for samples without a case number, 35808028 is a duplicate case number for two patients (prospective cohort)
+```
+
+# Add specific columns from the FAP metadata
+```{r}
+cols_to_add <- c("number_of_polyps_colonoindex_date")
+mdata_to_add <- mdata_fap %>% mutate(patient_id = paste0(track_number, "_FAP Cohort")) %>% select(patient_id, all_of(cols_to_add))
+mdata <- mdata %>% left_join(mdata_to_add, by = "patient_id")
+```
+
+
+```{r}
+write.csv(mdata, "metadata/clean/metadata_combined.csv", row.names = FALSE)
+```
+
+## Compare key metadata features between groups
+```{r}
+target_samples <- read.csv("qiime/combined/6_Taxonomy_GTDB/feature_table.tsv",sep = "\t", check.names = F) %>% 
+                  select(-taxon) %>% colnames()
+batch_24_specific <- c("35919746","35956773" ) # patients 4 and 7
+```
+
+```{r}
+df <- mdata %>% filter(sample_id %in% c(target_samples,batch_24_specific)) %>%
+      select(patient_id, age, gender, phenotype, surgery_type, 
+             bmi,is_current_smoker, is_ever_smoker, n_polyps) %>% unique() %>% 
+                 filter(phenotype != "Fatty Liver") %>% 
+                 mutate(phenotype = factor(phenotype, levels = c("Classical FAP","Non-classical FAP","Control")),
+                        smoking = case_when(is_ever_smoker == 0 ~ "Non-smoker",
+                                            is_current_smoker == 0 ~ "Former smoker",
+                                           TRUE ~ "Current smoker"), 
+                         is_ever_smoker = ifelse( is_ever_smoker == 0, "Non-smoker","Smoker"))
+df %>% sample_n(10)
+```
+
+```{r}
+p_age <- ggplot(df, aes(phenotype, age, fill = phenotype, color = phenotype)) + plot_box_and_jitter(palette = palette) + labs(y = "Age", x ="")
+p_bmi <- ggplot(df, aes(phenotype, bmi, fill = phenotype, color = phenotype)) + plot_box_and_jitter(palette = palette) + labs(y = "BMI", x = "")
+```
+
+```{r}
+ggdata <- df %>% count(phenotype, is_ever_smoker) %>% group_by(phenotype) %>% mutate(perc = n/sum(n))
+
+p_smoking <- ggplot(ggdata, aes(x = phenotype, y = perc, fill = is_ever_smoker, label = n)) +  
+  geom_bar(position="fill", stat="identity",colour="black",) +
+  geom_text(position = position_fill(vjust = 0.5), size = 3, color = "black") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = rev(c( "#f2f2f2", "#7f7f7f"))) + 
+  labs(y = "Proportion", fill = "Smoking status", x = "") +
+  theme_bw(base_size = 12) + theme(legend.position = "top")
+```
+
+
+```{r}
+ggdata <- df %>% count(phenotype, gender) %>% group_by(phenotype) %>% mutate(perc = n/sum(n))
+
+p_gender <- ggplot(ggdata, aes(x = phenotype, y = perc, fill = gender, label = n)) +  
+  geom_bar(position="fill", stat="identity",colour="black",) +
+  geom_text(position = position_fill(vjust = 0.5), size = 3, color = "black") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = rev(c( "#f2f2f2", "#7f7f7f"))) + 
+  labs(y = "Proportion", fill = "Gender", x = "") +
+  theme_bw(base_size = 12) + theme(legend.position = "top")
+```
+
+```{r}
+ggdata <- df %>% filter(phenotype != "Control")
+p_polyps <- ggplot(ggdata, aes(x = phenotype, y = n_polyps, fill = phenotype, color = phenotype)) + 
+   plot_box_and_jitter(palette = palette) + 
+  labs(y = "Number of polyps", x = "")
+```
+
+```{r}
+ggdata <- df %>% filter(phenotype != "Control") %>% count(phenotype, surgery_type) %>% group_by(phenotype) %>% mutate(perc = n/sum(n)) %>%
+          mutate(surgery_type = factor(surgery_type, levels = rev(c("No surgery", "Subtotal colectomy", "Pouch"))))
+
+p_surgery <- ggplot(ggdata, aes(x = phenotype, y = perc, fill = surgery_type, label = n)) +  
+  geom_bar(position="fill", stat="identity",colour="black",) +
+  geom_text(position = position_fill(vjust = 0.5), size = 3, color = "black") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = rev(c( "#f2f2f2","#cccccc", "#7f7f7f"))) + 
+  labs(y = "Proportion", fill = "Surgery", x = "") +
+  theme_bw(base_size = 12) + theme(legend.position = "top")
+```
+
+```{r fig.height=10, fig.width=10}
+(p_age + p_bmi)/(p_smoking + p_gender)/(p_polyps + p_surgery) +patchwork::plot_annotation(tag_levels = 'A')
+
+```
+
+```{r}
+wilcox_tests <- rbind(wilcox_test_by_pair(df, "phenotype", "age ~ phenotype", FALSE) %>% mutate(category = "age"),
+                      wilcox_test_by_pair(df, "phenotype", "bmi ~ phenotype", FALSE) %>% mutate(category = "bmi"),
+                      wilcox_test_by_pair(df %>% filter(phenotype != "Control"), "phenotype", "n_polyps ~ phenotype", FALSE) %>% mutate(category = "n_polyps"))
+wilcox_tests %>% add_significance()
+```
+```{r}
+chi_sq_tests <- c((df %>% select(phenotype, is_current_smoker) %>% table() %>% chisq.test())$p.value,
+                  (df %>% select(phenotype, gender) %>% table() %>% chisq.test())$p.value,
+                  (df %>% filter(phenotype != "Control") %>% mutate(phenotype = as.character(phenotype)) %>% 
+          select(phenotype, surgery_type)  %>% table() %>% chisq.test())$p.value) %>% as.numeric()
+chi_sq_tests <- data.frame(p_value = chi_sq_tests, category = c("smoking", "gender", "surgery")) %>% mutate(group1 = "multi group comparison", group2 = NA)
+```
+
+
+```{r}
+statistics_results <- rbind(wilcox_tests, A)  %>% add_significance()
+statistics_results
+```
+

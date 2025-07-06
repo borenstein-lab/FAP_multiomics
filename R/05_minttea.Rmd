@@ -1,0 +1,365 @@
+---
+title: "Metabolomic-taxonomic combined analysis"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+#devtools::install_github("efratmuller/MintTea")   
+library(MintTea)
+theme_set(theme_bw(base_size = 15))
+source("code/R/visualization.R")
+source("code/R/utils.R")
+
+library(ggraph)
+library(tidygraph)
+```
+
+```{r}
+check_correlations <- function(mat){
+  mat_corr <- cor(mat)
+  mat_corr_diag <- mat_corr[lower.tri(mat_corr)]
+  print(paste("Maximum correlation in the matrix:", round(max(mat_corr_diag),3)))
+  print(paste("Minimum correlation in the matrix:", round(min(mat_corr_diag),3)))
+  pheatmap::pheatmap(mat_corr, show_rownames = F, show_colnames = F)
+}
+```
+
+
+## Data import
+
+```{r}
+palette_df <- read.csv("metadata/clean/project_palette.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+palette <- setNames(palette_df$color, palette_df$label)
+```
+
+### Metadata
+```{r}
+mdata <- read.csv("metadata/clean/core_metadata_with_mean.csv") %>% 
+         filter(phenotype != "Fatty Liver") %>% 
+         mutate(is_fap = ifelse(is_fap, "FAP","Control")) %>% 
+         select(sample_id, patient_id, is_fap)
+```
+
+### Non-rare genera
+```{r}
+taxa_df <- read.csv("processed_data/genus_ra_non_rare.csv") %>% 
+           left_join(mdata %>% select(-is_fap), by = "sample_id") %>% select(-sample_id) %>%
+           tibble::column_to_rownames("patient_id")
+colnames(taxa_df) <- gsub(".*g__","T__",colnames(taxa_df))
+names(taxa_df) <- make.names(names(taxa_df))
+```
+
+```{r}
+epsilon <- min(taxa_df[taxa_df != 0])/2
+clr_df <- compositions::clr(taxa_df + epsilon) %>% as.data.frame() %>% tibble::rownames_to_column("patient_id")
+check_correlations(clr_df %>% select(-patient_id))
+```
+
+
+```{r}
+check_correlations(taxa_df)
+```
+
+
+### Metabolomics
+```{r}
+compound_names <- read.csv('metabolomics/compound_names.csv') %>% select(-X) %>% unique()
+# manually adjust long compound names
+compound_names$compound_name[compound_names$compound_name == "2-Methylglutaric acid/3-Methylglutaric acid"] <- "2/3-Methylglutaric acid" 
+compound_map <- compound_names$compound_name
+names(compound_map) <- compound_names$compound_id
+
+met_df <-  read.csv('metabolomics/transformed_df.csv', check.names = T) %>% rename(sample_id = "case_number") %>% 
+            mutate(sample_id = as.character(sample_id)) %>% 
+           left_join(mdata %>% select(-is_fap), by = "sample_id") %>% select(-sample_id) %>% filter(!is.na(patient_id))
+colnames(met_df) <- c(paste0("M__", colnames(met_df)[1:ncol(met_df)-1]), "patient_id")
+```
+
+```{r}
+check_correlations(met_df %>% select(-patient_id))
+# result <- remove_correlated_features(met_df %>% tibble::column_to_rownames("patient_id"), cutoff = 0.8)
+# met_df_filt <- result$filtered_df %>% tibble::rownames_to_column("patient_id")
+# met_mapping <- stack(result$mapping) %>% rename(corr_feature = values, feature = ind) %>%
+#                mutate_all(~ gsub("M__", "", .)) %>%  mutate_all(~gsub("\\.", " ", .)) %>% 
+#                left_join(compound_names, by = c("corr_feature" = "compound_id"))
+```
+
+```{r}
+#check_correlations(met_df_filt)
+```
+
+### Combined data
+```{r}
+data <- met_df %>%
+        inner_join(clr_df, by = "patient_id") %>% 
+        inner_join(mdata %>% select(-sample_id) %>% unique(), by = "patient_id")
+```
+
+
+## Run MintTea
+### 1. Run MintTea for taxa-metabolimcs
+```{r}
+minttea_results <- MintTea(data , view_prefixes = c('T', 'M'),
+                           study_group_column = "is_fap",
+                           control_group_name = "Control",
+                           case_group_name = "FAP",
+                           sample_id_column = "patient_id",
+                           seed = 42)
+```
+
+```{r}
+prefix_mapping <- c("T" = "Genus", "M" = "Metabolite")
+module <- minttea_results$`keep_10//des_0.5//nrep_10//nfol_5//ncom_5//edge_0.8`$module1
+
+correlations <- data %>% select(all_of(c("patient_id",module$features))) %>% 
+                tibble::column_to_rownames("patient_id") %>% cor() %>% 
+                as.data.frame() %>% tibble::rownames_to_column("feature.x") %>% 
+                tidyr::pivot_longer(-feature.x, names_to = "feature.y", values_to = "r")
+
+df <- module$module_edge %>% 
+  left_join(correlations, by = c("feature.x", "feature.y")) %>% 
+  tidyr::separate(feature.x, into = c("prefix.x", "feature.x"), sep = "__", extra = "merge") %>% 
+  tidyr::separate(feature.y, into = c("prefix.y", "feature.y"), sep = "__", extra = "merge") %>% 
+  left_join(compound_names, by = c("feature.x" = "compound_id")) %>%
+  left_join(compound_names, by = c("feature.y" = "compound_id")) %>%
+  mutate(feature_1 = ifelse(is.na(compound_name.x), feature.x, compound_name.x),
+         feature_2 = ifelse(is.na(compound_name.y), feature.y, compound_name.y))
+
+
+
+edges <- df %>% select(feature_1, feature_2, edge_weight, r)
+nodes <- rbind(df %>% select(feature_1, prefix.x) %>% rename(name = feature_1, Omic = prefix.x),
+               df %>% select(feature_2, prefix.y) %>% rename(name = feature_2, Omic = prefix.y)) %>% unique() %>% 
+         mutate(omic = prefix_mapping[Omic])
+```
+
+
+```{r, fig.width=6, fig.height=5}
+
+g <- tidygraph::tbl_graph(edges = edges, nodes = nodes, directed = F) 
+layout <- create_layout(g, layout = 'igraph', algorithm = 'nicely')
+
+p1 <-ggraph(layout) + 
+    geom_edge_fan(aes(color = r), alpha = 0.3, width = 2, position = "jitter", label_dodge = T) +
+    #scale_edge_color_gradient(low = "grey90", high = "grey30") +  
+    scale_edge_color_gradient2(low = "#2a428b", mid = "#eff7f6", high = "#BF3C6F", midpoint = 0, 
+                              limits = c(-1, 1), name = "R") +
+    geom_node_point(aes(fill = omic), size = 6, shape = 21, alpha = 0.9) + 
+    geom_node_text(aes(label = name), repel = TRUE, size = 4.5, check_overlap = T) +
+    scale_fill_manual(values = c("Metabolite" = "grey30", "Genus" = "grey60")) + 
+    #scale_color_manual(values = c("Metabolite" = "#f4a261", "Genus" = "#2a9d8f")) + 
+    labs(edge_color = "R", fill = "Omic") + 
+    theme_void()
+p1
+```
+
+```{r}
+ggdata <- data %>% select(all_of(c("patient_id",module$features))) %>% 
+  tidyr::pivot_longer(- patient_id, names_to = "feature", values_to = "value") %>% 
+  mutate(feature = gsub(".*__", "", feature)) %>% 
+  left_join(compound_names, by = c("feature" = "compound_id")) %>% 
+  left_join(mdata %>% select(patient_id, is_fap), by = "patient_id") %>%
+  mutate(feature = ifelse(is.na(compound_name), feature, compound_name),
+         omic = ifelse(is.na(compound_name), "Genus", "Metabolite"))
+
+
+boxplots <- ggplot(ggdata, aes(x = reorder(feature,-value), y = value, fill = is_fap)) +
+  geom_boxplot(alpha = 0.6, outlier.size = 1) + scale_fill_manual(values = palette) + 
+  labs( y = NULL, fill = "Phenotype", x = NULL) + 
+  facet_wrap(~omic, scales = "free", nrow = 2,  strip.position = "left", 
+                labeller = as_labeller(c(Genus = "RA (CLR)", Metabolite = "Peak Area") ) ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top",
+        strip.background = element_blank(), strip.placement = "outside")
+
+
+p2 <- ggplot(ggdata %>% filter(omic == "Genus"), aes(x = reorder(feature,-value), y = value, fill = is_fap)) +
+  geom_boxplot(alpha = 0.6, outlier.size = 1) + scale_fill_manual(values = palette) + 
+  labs(subtitle = "Genus", y = "RA (CLR)", fill = "Phenotype", x= "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p3 <- ggplot(ggdata %>% filter(omic == "Metabolite"), aes(x = reorder(feature,-value), y = value, fill = is_fap)) +
+  geom_boxplot(alpha = 0.6, outlier.size = 1) + scale_fill_manual(values = palette) + 
+  labs(subtitle = "Metabolite", y = "Peak Area", fill = "Phenotype",x = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+```{r}
+boxplots
+```
+
+
+```{r fig.height=7, fig.width=15}
+boxplots <- (p2/p3) + plot_layout( guides = "collect") & theme(legend.position = 'bottom')
+
+p1 + boxplots/p4
+
+
+p1 + theme(legend.position = 'bottom') + boxplots + p4+
+plot_annotation(tag_levels = 'A')+ 
+plot_layout(widths = c(1.8,1,1.2))
+```
+
+
+```{r fig.height=7, fig.width=15}
+#library(patchwork)
+bottom_row <- plot_grid(p2, p3, ncol = 2, align = "hv", rel_widths = c(1, 1))
+
+boxplots <- (p2+p3) + plot_layout(ncol = 2, guides = "collect")
+bottom <- plot_grid(boxplots, p4, ncol = 1, rel_heights = c(1, 1))
+bottom
+
+# Combine plot_1 and bottom into final figure
+final_plot <- plot_grid(p1, bottom, ncol = 2, rel_widths = c(1, 1), align = "hv")
+final_plot
+
+plot_1 <- p1 + theme(plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm"))
+p2 <- p2 + theme(plot.margin = unit(c(0.1, 0.1, -5, 0.1), "cm"))
+p3 <- p3 + theme(plot.margin = unit(c(0.1, 0.1, -5, 0.1), "cm"))
+p4 <- p4 + theme(plot.margin = unit(c(-5, 0.1, 0.1, 0.1), "cm"))
+
+left_side <- ((p2+p3)/p4) + plot_layout(ncol = 1, heights = c(1,2), guides = "collect") 
+plot_1 + left_side +
+plot_annotation(tag_levels = 'A')+ 
+plot_layout(widths = c(1,1))
+
+left_side
+```
+
+```{r}
+source("code/R/categorical_metadata_analysis.R")
+ggdata <- data %>% select(all_of(c("patient_id",module$features)))
+
+results <- get_binary_predictability(ggdata, mdata, "patient_id", c("is_fap"))
+df_roc_plot <- results$plots$is_fap$data %>% mutate(shuffled_flag == "True model", "", )
+print(results$results)
+```
+
+```{r, fig.height=5, fig.width=7}}
+p4 <- ggplot(df_roc_plot, aes(x = x, group = shuffle_index)) +
+  geom_path(aes(y = `median`, color = shuffled_flag), size =1.2) + 
+  geom_abline(slope=1, intercept = 1, linetype = "dashed", alpha=0.9, color = "grey10", size = 1) + 
+  scale_x_reverse() + #coord_equal() + 
+  labs(x = 'Specificity', y = 'Sensitivity', fill = "", color = "", alpha = "") +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = shuffled_flag, alpha = shuffled_flag)) +
+  scale_alpha_manual(values = c('Null models' = 0.2, 'True model' = 0.4)) +
+  scale_color_manual(values = c('Null models' = 'grey60', 'True model' = '#2F5A91')) +
+  scale_fill_manual(values = c('Null models' = 'grey60', 'True model' = '#2F5A91')) +theme(legend.position = c(0.8, 0.2))
+
+```
+
+
+
+```{r, fig.width=20, fig.height=20}
+pos_pairs <- df %>% filter(r>0) %>% select(feature.x, feature.y)
+pos_cor <- lapply(1:nrow(pos_pairs), function(i) as.vector(unlist(pos_pairs[i, ])))
+
+neg_pairs <- df %>% filter(r<0) %>% select(feature.x, feature.y)
+neg_cor <- lapply(1:nrow(neg_pairs), function(i) as.vector(unlist(neg_pairs[i, ])))
+
+df <- data %>% select(all_of(module$features))
+colnames(df) <- gsub(".*__", "",colnames(df))
+label_map <- compound_map[colnames(df)] %>% unname()
+label_map <- ifelse(is.na(label_map), colnames(df), label_map)
+names(label_map) <- colnames(df)
+
+# Loop through combinations and plot
+#pair_combos <- combn(colnames(df), 2, simplify = FALSE)
+pos_plots <- lapply(pos_cor, function(pair) {
+  ggplot(df, aes_string(x = pair[1], y = pair[2])) +
+    stat_smooth(method = "lm", color = "black", linetype = "dashed") + 
+    ggpubr::stat_cor(aes(label = ..r.label..), label.x.npc = "left", label.y.npc = "top") +
+    geom_point(alpha = 0.6)+ labs(x = label_map[pair[1]], y = label_map[pair[2]]) + 
+    theme_minimal()
+})
+neg_plots <- lapply(neg_cor, function(pair) {
+  ggplot(df, aes_string(x = pair[1], y = pair[2])) +
+    stat_smooth(method = "lm", color = "black", linetype = "dashed") + 
+    ggpubr::stat_cor(aes(label = ..r.label..), label.x.npc = "left", label.y.npc = "bottom") +
+    geom_point(alpha = 0.6)+ labs(x = label_map[pair[1]], y = label_map[pair[2]]) + 
+    theme_minimal()
+})
+gridExtra::grid.arrange(grobs = pos_plots, ncol = 10, top = "Pairwise Correlation of Module 1 features - positive correlations")
+gridExtra::grid.arrange(grobs = neg_plots, ncol = 5, top = "Pairwise Correlation of Module 1 features - negative correlations")
+```
+
+```{r fig.height=10, fig.width=10}
+#library(patchwork)
+p1 + (p2/p3) + 
+plot_layout(ncol = 2, widths = c(3, 1), guides = "collect") +
+plot_annotation(tag_levels = 'A')
+```
+
+```{r}
+matched_compounds <- read.csv( "processed_data/compound_id_to_ko.csv")
+pathways <- read.csv("processed_data/pathways_annotated.csv")
+
+pathway_metabolite_overlap <- pathways %>% filter(kegg_id %in% matched_compounds$kegg_id) %>% count(pathway_id) %>% 
+                              filter(n >=3) %>% pull(pathway_id)
+pathway_sizes <- pathways %>% filter(pathway_id %in% pathway_metabolite_overlap) %>% group_by(pathway_id) %>% summarise(pathway_size = n()) %>% ungroup()
+pathways_filt <- pathways %>% filter(pathway_id %in% pathway_metabolite_overlap) %>% 
+                 group_by(pathway_name) %>% mutate(n = n()) %>% ungroup() %>%
+                 filter(n <= 200)
+                
+```
+
+```{r}
+ggplot(pathway_sizes, aes(x= pathway_size)) + geom_density() + scale_x_log10() +
+  geom_vline(xintercept = 200)
+```
+
+```{r}
+a<- pathways %>% filter(kegg_id %in% target_kegg)
+```
+
+
+```{r}
+target_metabolites <- grep("M__",module$features, value = T) %>% gsub("M__","", .)
+target_kegg <- matched_compounds %>% filter(compound_id %in% target_metabolites) %>% pull(kegg_id)
+all_metabolites <- pathways_filt$kegg_id %>% unique()
+```
+
+```{r}
+# Get unique pathways
+unique_pathways <- unique(pathways_filt$pathway_name )
+
+# Initialize results
+ora_results <- data.frame(pathway = character(),
+                          n_overlap = numeric(),
+                          pathway_size = numeric(), 
+                          p_value = numeric(),
+                          stringsAsFactors = FALSE)
+
+for (pw in unique_pathways) {
+  pw_metabolites <- pathways$kegg_id[pathways$pathway_name == pw]
+  
+  # Construct contingency table
+  a <- sum(target_kegg %in% pw_metabolites)                  # in cluster AND in pathway
+  b <- sum(target_kegg %in% all_metabolites & !(target_kegg %in% pw_metabolites))  # in cluster NOT in pathway
+  c <- sum(!(all_metabolites %in% target_kegg) & (all_metabolites %in% pw_metabolites))    # not in cluster BUT in pathway
+  d <- sum(!(all_metabolites %in% target_kegg) & !(all_metabolites %in% pw_metabolites))   # neither
+
+  contingency <- matrix(c(a, b, c, d), nrow = 2)
+
+  # Fisher's test
+  test <- fisher.test(contingency, alternative = "greater")
+
+  # Save result
+  ora_results <- rbind(ora_results,
+                       data.frame(pathway = pw,
+                                  n_overlap = a,
+                                  pathway_size = length(pw_metabolites),
+                                  p_value = test$p.value,
+                                  stringsAsFactors = FALSE))
+}
+
+# Adjust p-values
+ora_results$p_adj <- p.adjust(ora_results$p_value, method = "fdr")
+
+```
+
+
+
+

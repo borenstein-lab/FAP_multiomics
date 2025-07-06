@@ -1,0 +1,149 @@
+---
+title: "Taxonomic comparison to public data (Katona et.al)"
+output: html_notebook
+---
+
+```{r}
+
+library(ggplot2)
+library(dplyr) 
+
+theme_set(theme_bw(base_size = 15))
+source("code/R/visualization.R")
+source("code/R/utils.R")
+```
+
+
+## Data import
+### Palette
+```{r}
+palette_df <- read.csv("metadata/clean/project_palette.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+palette <- setNames(palette_df$color, palette_df$label)
+```
+
+### Cohort data
+```{r}
+taxa_df <- read.csv("processed_data/genus_ra_non_rare.csv") %>% tibble::column_to_rownames("sample_id")
+colnames(taxa_df) <- colnames(taxa_df) %>% gsub(".*g__","",.)
+```
+
+```{r}
+mdata <- read.csv("metadata/clean/core_metadata_with_mean.csv") %>% 
+         mutate(phenotype_binary = ifelse(phenotype %in% c("Classical FAP", "Non-classical FAP"), "FAP", "Control"),
+                phenotype_binary = factor(phenotype_binary , levels = c("FAP", "Control")),
+                cohort = "Internal") %>% 
+         filter(sample_id %in% rownames(taxa_df)) 
+patient_mdata <- mdata %>% select(-sample_id, -batch) %>% unique()
+mdata %>% head()
+```
+
+### Katona et.al
+
+```{r}
+katona <- read.csv("qiime/katona/6_Taxonomy_GTDB/feature_table.tsv", sep = "\t" ) %>% 
+          filter(stringr::str_detect(taxon , ";g__.+", )) %>%
+          tibble::column_to_rownames("taxon") %>%  mutate_all(~ . / sum(.)) %>% t() %>% as.data.frame()
+colnames(katona) <- colnames(katona) %>% gsub(".*;g__","",.)
+```
+
+```{r}
+katona_mdata <- read.csv("metadata/clean/katona_et_al.csv") %>% 
+                rename(sample_id = sample) %>% filter(sample_id %in% rownames(katona))
+colnames(katona_mdata) <- colnames(katona_mdata) %>% tolower()
+katona_mdata <- katona_mdata %>% select(-tissuetype, -bioproject, -sample_identifier) %>% 
+                mutate(phenotype_binary = ifelse(study_group == "Polyposis", "FAP", "Control"),
+                       cohort = "Katona")
+                
+katona_mdata %>% head()
+```
+
+```{r}
+katona_mdata %>% count(gene_group)
+katona_mdata %>% count(study_group)
+```
+
+
+```{r}
+katona_filt <- remove_rare_features(katona, prevalence_cutoff = 0.1,
+                                                avg_abundance_cutoff = 0.0005,
+                                                rescale = T) %>% as.data.frame()
+write.csv(katona_filt %>% tibble::rownames_to_column("sample_id"),"processed_data/katona_non_rare.csv", row.names = FALSE)
+```
+### combine metadata
+```{r}
+shared_cols <- base::intersect(colnames(mdata), colnames(katona_mdata))
+core_mdata <- rbind(mdata %>% select(shared_cols), katona_mdata %>% select(shared_cols))
+write.csv(core_mdata, "metadata/clean/core_metadata_cross_cohort.csv", row.names = FALSE)
+```
+
+## Analysis
+```{r}
+shared_genera <- intersect(colnames(katona_filt), colnames(taxa_df))
+print(paste("Number of shared genera:",length(shared_genera)))
+```
+
+```{r}
+taxa_df_sub <- taxa_df %>% select(shared_genera) %>% t() %>% as.data.frame() %>% mutate_all(~ . / sum(.))
+
+katona_sub <- katona_filt %>% select(shared_genera) %>% t() %>% as.data.frame() %>% mutate_all(~ . / sum(.))
+```
+
+```{r}
+comb <- rbind(taxa_df_sub %>% t() %>% as.matrix(),
+                  katona_sub %>% t() %>% as.matrix()) #%>% as.matrix()# %>% t()
+comb[is.na(comb)] <- 0
+genus_dist <- vegan::vegdist(comb, method = "bray") %>% as.matrix()
+```
+
+
+
+
+```{r}
+pcoa_df <- get_pcoa(genus_dist, 2)
+eig_vals <- pcoa_df[[1]]
+pcoa_df <- pcoa_df[[2]] %>% left_join(core_mdata, by = "sample_id")
+
+# Plot PCs 1 and 2 by phenotype
+ggp <- ggplot(pcoa_df %>% mutate(label = paste(phenotype_binary, cohort)),aes(axis_1, axis_2,  color =label)) +
+  geom_point(size = 2, alpha = 0.7) + 
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) #+ scale_color_manual(values = palette) 
+
+plot(ggp)
+```
+
+## Comparison of percentile-normalized data (generated in the notebook python/percentile_normalization.ipynb)
+
+```{r}
+perc_int <- read.csv("qiime/batch_correct/genus_ra_non_rare_perc_norm.tsv", sep = "\t") %>% rename(sample_id = "X")
+colnames(perc_int) <- colnames(perc_int) %>% gsub(".*g__","",.)
+perc_kat <- read.csv("qiime/batch_correct/katona_non_rare_perc_norm.tsv", sep = "\t") %>% rename(sample_id = "X")
+```
+
+```{r}
+perc_df <- rbind(perc_int %>% select(all_of(c("sample_id",shared_genera))),
+                 perc_kat %>% select(all_of(c("sample_id",shared_genera))))
+
+perc_df_long <- perc_df %>% 
+           tidyr::pivot_longer(-sample_id, names_to = "genus", values_to = "perc_norm") %>% 
+           left_join(core_mdata, by = "sample_id")
+```
+
+
+```{r, fig.width=15, fig.height=5}
+ggplot(perc_df_long %>% filter(phenotype_binary == "FAP"), aes(x = genus, y = perc_norm, fill = cohort))  + 
+  geom_boxplot() + labs(x = "", y = "Percentile relative to control") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") 
+```
+
+```{r}
+fap_samples <- core_mdata %>% filter(phenotype_binary == "FAP") %>% pull(sample_id)
+pca <- get_pca(perc_df %>% filter(sample_id %in% fap_samples) %>%  tibble::column_to_rownames("sample_id"),2)
+eig_vals <- pca[[1]]
+pca_df <- pca[[2]] %>% left_join(core_mdata, by = "sample_id")
+loadings <- pca[[3]]
+
+plot_pca(pca_df, 1,2,eig_vals, "cohort")
+```
+
