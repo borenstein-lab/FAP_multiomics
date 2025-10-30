@@ -1406,9 +1406,6 @@ get_binary_predictability <- function(feat_table,
     stop("Invalid 'feature_selection' argument. Only '' (no FS) and 'MRMR' supported")
   
   # Additional validations
-  # print(sum(sapply(metadata, class) == 'character'))
-  # print(sapply(metadata, class))
-  # print(class(metadata[,vars_to_analyze]))
   if (feature_selection == 'MRMR' & class(metadata[,vars_to_analyze]) == 'character')
     stop('MRMR feature selection does not support character (categorical) features, only numeric or (ordered) factors')
   

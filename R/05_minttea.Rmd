@@ -3,6 +3,7 @@ title: "Metabolomic-taxonomic combined analysis"
 output: html_notebook
 ---
 
+
 ```{r}
 library(ggplot2)
 library(dplyr)
@@ -11,7 +12,8 @@ library(MintTea)
 theme_set(theme_bw(base_size = 15))
 source("code/R/visualization.R")
 source("code/R/utils.R")
-source("code/R/categorical_metadata_analysis.R")
+source("code/R/statistics.R")
+#source("code/R/categorical_metadata_analysis.R")
 
 library(ggraph)
 library(tidygraph)
@@ -28,22 +30,26 @@ check_correlations <- function(mat){
 ```
 
 
-## Data import
+# 1. Data import
 
 ```{r}
 palette_df <- read.csv("metadata/clean/project_palette.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
 palette <- setNames(palette_df$color, palette_df$label)
 ```
 
-### Metadata
+## 1.1 Metadata
 ```{r}
-mdata <- read.csv("metadata/clean/core_metadata_with_mean.csv") %>% 
-         filter(phenotype != "Fatty Liver") %>% 
-         mutate(is_fap = ifelse(is_fap, "FAP","Control")) %>% 
+mdata_all <- read.csv("metadata/clean/core_metadata_with_mean.csv") %>% filter(phenotype != "Fatty Liver") %>% 
+         mutate(phenotype_binary = ifelse(phenotype %in% c("Classical FAP", "Non-classical FAP"), "FAP", "Control"),
+                phenotype_binary = factor(phenotype_binary , levels = c("FAP", "Control")),
+                gender = ifelse(gender == "Female", 1,0))
+
+mdata <- mdata_all %>% 
+         # mutate(is_fap = ifelse(is_fap, "FAP","Control")) %>% 
          select(sample_id, patient_id, is_fap)
 ```
 
-### Non-rare genera
+## 1.2 Non-rare genera
 ```{r}
 taxa_df <- read.csv("processed_data/genus_ra_non_rare.csv") %>% 
            left_join(mdata %>% select(-is_fap), by = "sample_id") %>% select(-sample_id) %>%
@@ -54,282 +60,462 @@ names(taxa_df) <- make.names(names(taxa_df))
 
 ```{r}
 epsilon <- min(taxa_df[taxa_df != 0])/2
-clr_df <- compositions::clr(taxa_df + epsilon) %>% as.data.frame() %>% tibble::rownames_to_column("patient_id")
-check_correlations(clr_df %>% select(-patient_id))
+taxa_df_no_zero <- taxa_df + epsilon
+taxa_df_no_zero <- taxa_df_no_zero/rowSums(taxa_df_no_zero)
+
+clr_df <- compositions::clr(taxa_df_no_zero) %>% as.data.frame() %>% tibble::rownames_to_column("patient_id")
+taxa_df <- taxa_df %>% tibble::rownames_to_column("patient_id")
+#taxa_df <- clr_df #%>% tibble::rownames_to_column("patient_id")
 ```
 
 
-```{r}
-check_correlations(taxa_df)
-```
-
-
-### Metabolomics
+## 1.3 Metabolomics
 ```{r}
 compound_names <- read.csv('metabolomics/compound_names.csv') %>% select(-X) %>% unique()
 # manually adjust long compound names
-compound_names$compound_name[compound_names$compound_name == "2-Methylglutaric acid/3-Methylglutaric acid"] <- "2/3-Methylglutaric acid" 
+compound_names$compound_name[compound_names$compound_name == "2-Methylglutaric acid/3-Methylglutaric acid"] <- "2|3-Methylglutaric acid" 
 compound_map <- compound_names$compound_name
 names(compound_map) <- compound_names$compound_id
 
+# remove drug metabolites
+drug_metabolites <- c("Vinorelbine", "Simvastatin acid", "Acetylsalicylic acid", "Salicylic acid",
+                      "Bestatin", "Trichostatin A", "Vincamine", "Castanospermine",
+                      "Allopurinol", "4-Acetamidophenol", "4-Aminophenol")
+drug_metabolites_to_remove <- grep(paste(drug_metabolites, collapse = "|"), compound_names$compound_name, value = T, ignore.case = F)
+drug_ids_to_remove <- compound_names %>% filter(compound_name %in% drug_metabolites_to_remove) %>% pull(compound_id)
+```
+
+```{r}
 met_df <-  read.csv('metabolomics/transformed_df.csv', check.names = T) %>% rename(sample_id = "case_number") %>% 
             mutate(sample_id = as.character(sample_id)) %>% 
-           left_join(mdata %>% select(-is_fap), by = "sample_id") %>% select(-sample_id) %>% filter(!is.na(patient_id))
+           left_join(mdata %>% select(-is_fap), by = "sample_id") %>% 
+           select(-sample_id) %>% filter(!is.na(patient_id)) %>% select(-drug_ids_to_remove)
+
 colnames(met_df) <- c(paste0("M__", colnames(met_df)[1:ncol(met_df)-1]), "patient_id")
 ```
 
+## 1.4 blood tests
+
 ```{r}
-check_correlations(met_df %>% select(-patient_id))
-# result <- remove_correlated_features(met_df %>% tibble::column_to_rownames("patient_id"), cutoff = 0.8)
-# met_df_filt <- result$filtered_df %>% tibble::rownames_to_column("patient_id")
-# met_mapping <- stack(result$mapping) %>% rename(corr_feature = values, feature = ind) %>%
-#                mutate_all(~ gsub("M__", "", .)) %>%  mutate_all(~gsub("\\.", " ", .)) %>% 
-#                left_join(compound_names, by = c("corr_feature" = "compound_id"))
+blood_features <- read.csv("metadata/clean/blood_test_features.csv")
+blood_map <- blood_features$name
+names(blood_map) = blood_features$feature
 ```
 
 ```{r}
-#check_correlations(met_df_filt)
+blood_df <- read.csv("metadata/clean/metadata_combined.csv")
+
+blood_df <- blood_df %>% select(colnames(blood_df)[c(1,15:54)]) %>% unique() %>% 
+            filter(patient_id %in% met_df$patient_id) %>% 
+             mutate(across(.cols = -patient_id, .fns = ~ as.numeric(.)))
+colnames(blood_df) <- c("patient_id", paste0("B__", colnames(blood_df)[2:ncol(blood_df)]))
+
+cols_w_missing <- which(colSums((is.na(blood_df))) >0) %>% names()
+cols_w_high_similarity <- c("B__hba1c_mmolmol", "B__eosinophils", "B__lymphocytes", "B__mono", "B__neutrophils")
+
+blood_df <- blood_df %>% select(-all_of(c(cols_w_missing,cols_w_high_similarity)))
 ```
 
-### Combined data
+# 2. Multivariate analysis (logistic regression)
+
 ```{r}
-data <- met_df %>%
-        inner_join(clr_df, by = "patient_id") %>% 
-        inner_join(mdata %>% select(-sample_id) %>% unique(), by = "patient_id")
+regressors <- c("bmi", "age", "gender")
+mdata_logit <- mdata_all %>% select(all_of(c("patient_id", "is_fap", regressors))) %>% unique()
+ggdata_all <- data.frame()
+```
+
+```{r}
+combined<- met_df %>% inner_join(taxa_df , by = "patient_id") %>%  inner_join(blood_df, by = "patient_id")
+data_to_label <- list("Metabolomics" = met_df, 
+                      "Taxonomy" = taxa_df %>% filter(patient_id %in% met_df$patient_id), 
+                      "Blood chemistry" = blood_df %>% filter(patient_id %in% met_df$patient_id), 
+                      "Combined" = combined)
+```
+
+## 2.1 Logistic regression
+```{r}
+roc_df_all <- data.frame()
+feature_df_all <- data.frame()
+
+for (label in names(data_to_label)){
+  data <- data_to_label[[label]] %>% left_join(mdata_logit, by = "patient_id")
+  r <- run_glm_prediction(data %>% select(-patient_id, -is_fap), as.numeric(data$is_fap),
+                        n_shuffles = 0,n_repeats = 10, seed = 41, alpha = 0.5, scale_features = T)
+  
+  mean_auc <- r$auc_df$mean_auc
+  sd_auc <- r$auc_df$sd_auc
+  roc_df <- r$roc_df %>% mutate(auc = paste0("(AUC ",round(mean_auc,2), "±", round(sd_auc,2), ")", sep = ""),
+                                label = label, label_auc = paste(label, auc))
+  feature_df <- r$feature_importance_df %>% filter(abs(mean_coef) > sd_coef) %>% mutate(label = label)
+  roc_df_all <- rbind(roc_df_all, roc_df)
+  feature_df_all <- rbind(feature_df_all, feature_df)
+}
+```
+
+## 2.2 ROC curves
+```{r}
+label_order <- roc_df_all %>% select(label_auc, auc) %>% unique() %>% arrange(auc) %>% pull(label_auc)
+roc_df_all$label_auc <- factor(roc_df_all$label_auc, levels = label_order)
+```
+
+```{r}
+ggp_roc <- ggplot(roc_df_all, aes(x = specificity, group = label_auc)) +
+  geom_path(aes(y = `median`, color = label_auc), size = 1.5, alpha = 0.7) +
+  geom_abline(slope=1, intercept = 1, linetype = "dashed", alpha=0.7, color = "black") + 
+  coord_equal() + 
+  scale_color_manual(values = c("#ea7317","#43aa8b", "#386bec", "grey20")) + 
+  scale_fill_manual(values = c("#ea7317","#43aa8b", "#386bec", "grey20")) +
+  scale_x_reverse() +
+ geom_ribbon(aes(ymin = lower, ymax = upper, fill = label_auc), alpha = 0.2) +
+  labs(x = 'Specificity', y = 'Sensitivity', color = "Model", fill = "Model") +   theme_bw() +
+  theme(legend.position = c(0.72, 0.2), 
+        legend.background=element_blank())
+plot(ggp_roc)
+#ggsave(file="figures/f3/f3_roc_curves.svg", plot=ggp_roc, width=5, height=5)
+```
+
+## 2.3 Visualize differences
+```{r, fig.height=4, fig.width=10}
+prefix_mapping <- c("T" = "Genus", "M" = "Metabolite", "B" = "Blood Test")
+feature_map <- c(blood_map,compound_map, c("age" = "Age"))
+
+ggdata <- feature_df_all %>% 
+          mutate(direction = ifelse(mean_coef < 0 , "Control", "FAP"),
+                 direction = factor(direction, levels = c("FAP", "Control")),
+                 feature_orig = feature,
+                 prefix = prefix_mapping[gsub("__.*","", feature_orig)],
+                 feature = gsub("[A-Z]__", "", feature),
+                 feature_name = feature_map[feature],
+                 feature_name = ifelse(is.na(feature_name), feature,feature_name),
+                 feature_name = gsub("/.*","",feature_name),
+                 label = factor(label, levels = gsub(" \\(.*", "", label_order)))
+ggdata$prefix <- ifelse(is.na(ggdata$prefix), "Metadata", ggdata$prefix)
+
+feature_order <- ggdata %>% arrange(prefix, direction, feature_name) %>% pull(feature_name) %>% unique()
+ggdata$feature_name <- factor(ggdata$feature_name, levels = rev(feature_order))
+
+ggp_ribbon <- ggplot(ggdata %>% select(feature_name, prefix) %>% unique(),
+                     aes(feature_name, y = 1, fill = prefix)) + 
+              geom_tile(alpha = 0.6) + 
+              scale_fill_manual(values = c("#ea7317", "#386bec","#43aa8b", "grey20")) +
+              theme_minimal() + 
+              theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+ggp_ribbon
+
+
+ggp_heatmap <- ggplot(ggdata, aes(label, feature_name, color = direction, fill = direction))  + 
+               geom_point(aes(shape = c(prefix)),size = 5, color = "black")  + 
+               scale_shape_manual(values = c("Metabolite" = 22, "Genus" = 21, "Blood Test" = 24, "Metadata" = 23)) + 
+               labs(x = "Model", y = "Feature", fill = "Feature direction", color = "Feature direction") + 
+               scale_fill_manual(values = palette) + scale_color_manual(values = palette) + 
+               theme_bw(base_size = 10) + theme(legend.position = "none") +
+               coord_flip() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+ggp_heatmap
+
+#write.csv(ggdata, "figures/f3/f3_logistic_regression_features.csv",  row.names = F)
+```
+
+```{r}
+feature_to_name <- ggdata %>% select(feature_orig, feature_name) %>% unique() 
+t <- combined %>% left_join(mdata_all, by = "patient_id")  %>% 
+     select((c("patient_id","phenotype_binary", feature_to_name$feature_orig))) %>% 
+     tidyr::pivot_longer(cols = feature_to_name$feature_orig, names_to = "feature_orig") %>% 
+     left_join(feature_to_name, by = "feature_orig") %>% 
+     group_by(feature_name) %>% mutate(value_scaled = scale(value)[,1]) %>% ungroup() 
+
+p_vals <- c()
+for (feat in feature_order){
+
+  wilcox_res <- wilcox.test(value ~ phenotype_binary, data = t %>% filter(feature_name == feat))
+  p_vals <- c(p_vals, wilcox_res$p.value)
+}
+wilcox_results <- data.frame(feature_name = feature_order, p_value = p_vals) %>% add_significance()
+
+t <- t %>%  left_join(wilcox_results, by = "feature_name") %>% 
+     mutate(feature_name = factor(feature_name, levels = rev(feature_order)))
+```
+
+```{r}
+ggp_box <- ggplot(t, aes(feature_name, value_scaled, color = phenotype_binary,label = significance, fill = phenotype_binary)) + 
+          geom_boxplot(outlier.size = 0.5) + theme_bw(base_size = 10) + 
+          geom_text(y = 5, color = "black", size = 4) + 
+          labs(y = "Scaled feature value", x = "Feature", fill = "Phenotype", color = "Phenotype") + 
+          scale_fill_manual(values = palette) + scale_color_manual(values = palette) #+ coord_flip()
 ```
 
 
-## Run MintTea
-### 1. Run MintTea for taxa-metabolimcs
+```{r, fig.height=3.5, fig.width=10}
+ggp_final <- cowplot::insert_xaxis_grob(ggp_heatmap , ggp_ribbon, grid::unit(.1, "null"), position = "top") 
+ggp_final <- cowplot::insert_xaxis_grob(ggp_final , ggp_box, grid::unit(.7, "null"), position = "top")
+cowplot::ggdraw(ggp_final)
+#ggsave(file="figures/f3/f3_logistic_regression_features.svg", plot=ggp_final, height=3.5, width=9)
+```
+
 ```{r}
-minttea_results <- MintTea(data , view_prefixes = c('T', 'M'),
+#target_features <- ggdata %>% filter(prefix == "Blood Test") %>% pull(feature_orig)
+p_vals <- c()
+p_list <- list()
+ggdata <- combined %>% left_join(mdata_logit, by = "patient_id") %>%
+          mutate(is_fap = ifelse(is_fap, "FAP", "Control"),
+                 is_fap = factor(is_fap, levels = c("FAP", "Control")))
+for (feature in target_features){
+  res <- test_residuals(ggdata, regressors, feature, "is_fap") 
+  p_vals <- c(p_vals, res[[1]])
+  p_list[[feature]] <- res[[2]] + scale_color_manual(values = palette) +
+                       scale_fill_manual(values = palette) + 
+                       labs(x = blood_map[gsub("B__","", feature)])
+}
+data.frame(p_value = p_vals) %>% add_significance()
+p <- cowplot::plot_grid(plotlist = p_list)
+#ggsave("figures/f3/f3_bloot_test_residuals.svg", height = 6, width = 10)
+```
+
+
+# 3. MintTea
+## 3.1 Helper functions for calculating feature correlations
+```{r}
+# Helper to tidy rcorr output for one method
+tidy_rcorr <- function(mat, method) {
+  rc <- Hmisc::rcorr(as.matrix(mat), type = method)   # r and P matrices
+  r  <- rc$r
+  p  <- rc$P
+  # keep upper triangle without diagonal
+  keep <- upper.tri(r, diag = FALSE)
+  tibble(
+    feature.x = rownames(r)[row(r)][keep],
+    feature.y = colnames(r)[col(r)][keep],
+    r         = r[keep],
+    p         = p[keep],
+    method    = method
+  )
+}
+
+to_superscript_letter <- function(x) {
+  map <- c("A"="ᴬ","B"="ᴮ","G"="ᴳ")
+  sapply(strsplit(x, ","), function(letters) {
+    converted <- map[letters]
+    converted[is.na(converted)] <- letters   # fallback for unmapped letters
+    paste0(converted, collapse = "")
+  })
+}
+
+remove_superscript <- function(x) {
+  map <- c("A"="ᴬ","B"="ᴮ","G"="ᴳ")
+  pattern <- paste0("[", paste0(unname(map), collapse = ""), "]")
+  gsub(pattern, "", x)
+}
+```
+
+## 3.2 Run MintTea on the original data
+```{r}
+data <-  combined %>% left_join(mdata_logit, by = "patient_id")  %>% select(-all_of(regressors)) %>%  
+        mutate(is_fap = ifelse(is_fap, "FAP", "Control"))
+
+data <-  combined %>% left_join(mdata_logit, by = "patient_id") %>% 
+  tibble::column_to_rownames("patient_id") %>% 
+        get_residuals(., regressors) %>%
+        select(-all_of(regressors)) %>%
+        mutate(is_fap = ifelse(is_fap, "FAP", "Control")) %>% 
+  tibble::rownames_to_column("patient_id")
+
+minttea_results <- MintTea(data,
+                           view_prefixes = c('T', 'M', 'B'),
                            study_group_column = "is_fap",
                            control_group_name = "Control",
                            case_group_name = "FAP",
                            sample_id_column = "patient_id",
-                           seed = 42)
+                           seed = 41)
 ```
-
+## 3.3 Extract the network of the largest module
 ```{r}
-get_analysis_df_from_module <- function(module, data){
-  correlations <- data %>% select(all_of(c("patient_id",module$features))) %>% 
-                tibble::column_to_rownames("patient_id") %>% cor() %>% 
-                as.data.frame() %>% tibble::rownames_to_column("feature.x") %>% 
-                tidyr::pivot_longer(-feature.x, names_to = "feature.y", values_to = "r")
+prefix_mapping <- c("T" = "Genus", "M" = "Metabolite", "B" = "Blood Test")
+feature_map <- c(blood_map,compound_map)
 
-  df <- module$module_edge %>% 
-    left_join(correlations, by = c("feature.x", "feature.y")) %>% 
-    tidyr::separate(feature.x, into = c("prefix.x", "feature.x"), sep = "__", extra = "merge") %>% 
-    tidyr::separate(feature.y, into = c("prefix.y", "feature.y"), sep = "__", extra = "merge") %>% 
-    left_join(compound_names, by = c("feature.x" = "compound_id")) %>%
-    left_join(compound_names, by = c("feature.y" = "compound_id")) %>%
-    mutate(feature_1 = ifelse(is.na(compound_name.x), feature.x, compound_name.x),
-           feature_2 = ifelse(is.na(compound_name.y), feature.y, compound_name.y))
-  return(df)
-}
-
-plot_graph <- function(df, prefix_mapping = c("T" = "Genus", "M" = "Metabolite") ){
-  edges <- df %>% select(feature_1, feature_2, edge_weight, r)
-  nodes <- rbind(df %>% select(feature_1, prefix.x) %>% rename(name = feature_1, Omic = prefix.x),
-               df %>% select(feature_2, prefix.y) %>% rename(name = feature_2, Omic = prefix.y)) %>% unique() %>% 
-         mutate(omic = prefix_mapping[Omic])
-  g <- tidygraph::tbl_graph(edges = edges, nodes = nodes, directed = F) 
-  
-  layout <- create_layout(g, layout = 'igraph', algorithm = 'nicely')
-  p1 <-ggraph(layout) + 
-    geom_edge_fan(aes(color = r), alpha = 0.3, width = 2, position = "jitter", label_dodge = T) +
-    #scale_edge_color_gradient(low = "grey90", high = "grey30") +  
-    scale_edge_color_gradient2(low = "#2a428b", mid = "#eff7f6", high = "#BF3C6F", midpoint = 0, 
-                              limits = c(-1, 1), name = "R") +
-    geom_node_point(aes(fill = omic), size = 6, shape = 21, alpha = 0.9) + 
-    geom_node_text(aes(label = name), repel = TRUE, size = 4.5, check_overlap = T) +
-    scale_fill_manual(values = c("Metabolite" = "grey30", "Genus" = "grey60", "Blood Test" = "grey10")) + 
-    #scale_color_manual(values = c("Metabolite" = "#f4a261", "Genus" = "#2a9d8f")) + 
-    labs(edge_color = "R", fill = "Omic") + 
-    theme_void()
-  return(p1)
-}
-```
-
-
-```{r}
-prefix_mapping <- c("T" = "Genus", "M" = "Metabolite")
 module <- minttea_results$`keep_10//des_0.5//nrep_10//nfol_5//ncom_5//edge_0.8`$module1
+module_features <- c(module$module_edge$feature.x, module$module_edges$feature.y) %>% unique()
+feature_enrichment_group <- data %>% select( is_fap, module_features) %>% 
+                            tidyr::pivot_longer(cols = module_features, names_to = "feature") %>% 
+                            group_by(feature, is_fap) %>% summarise(value = mean(value)) %>% 
+                            group_by(feature) %>% filter(value == max(value, na.rm = TRUE)) %>% ungroup() %>%
+                            select(-value) %>% rename(raw = 1, enrichment_direction = 2)
+```
 
-correlations <- data %>% select(all_of(c("patient_id",module$features))) %>% 
-                tibble::column_to_rownames("patient_id") %>% cor() %>% 
-                as.data.frame() %>% tibble::rownames_to_column("feature.x") %>% 
-                tidyr::pivot_longer(-feature.x, names_to = "feature.y", values_to = "r")
 
+## 3.4 Find significant correlations between module features 
+```{r}
+cor_df <- data %>%
+  select(all_of(c("patient_id", module$features))) %>%
+  left_join(mdata_logit %>% select(c("patient_id"), regressors ), by = "patient_id") %>% 
+  tibble::column_to_rownames("patient_id") %>% tidy_rcorr(., "spearman") %>% 
+  filter(!feature.x %in% regressors, feature.y %in% regressors) %>%
+  mutate(fdr = p.adjust(p, method = "fdr")) 
+
+flag_features <- cor_df %>% filter(fdr < 0.05) %>%
+                 mutate(pref = toupper(substr(feature.y, start = 1, stop = 1))) %>% 
+                 group_by(feature.x) %>% 
+                 summarise(superscript = to_superscript_letter(paste(pref, collapse = ",")))
+```
+
+```{r}
+cor_df <- data %>%
+  select(all_of(c("patient_id", module$features))) %>%
+  tibble::column_to_rownames("patient_id") %>% tidy_rcorr(., "spearman") %>% 
+  mutate(fdr = p.adjust(p, method = "fdr")) %>% mutate(fdr = p.adjust(p, method = "fdr")) %>%
+  filter(abs(r) > 0.3, fdr < 0.05)
+```
+
+## 3.5 construct a module graph
+```{r}
 df <- module$module_edge %>% 
-  left_join(correlations, by = c("feature.x", "feature.y")) %>% 
+  inner_join(cor_df, by = c("feature.x", "feature.y")) %>% 
+  left_join(flag_features, by = "feature.x") %>% 
+  left_join(flag_features, by = c("feature.y" = "feature.x")) %>% 
+  mutate(across(starts_with("superscript"), ~replace_na(., ""))) %>% 
+  mutate(feature_x = feature.x, feature_y = feature.y) %>% 
   tidyr::separate(feature.x, into = c("prefix.x", "feature.x"), sep = "__", extra = "merge") %>% 
-  tidyr::separate(feature.y, into = c("prefix.y", "feature.y"), sep = "__", extra = "merge") %>% 
-  left_join(compound_names, by = c("feature.x" = "compound_id")) %>%
-  left_join(compound_names, by = c("feature.y" = "compound_id")) %>%
-  mutate(feature_1 = ifelse(is.na(compound_name.x), feature.x, compound_name.x),
+  tidyr::separate(feature.y, into = c("prefix.y", "feature.y"), sep = "__", extra = "merge") %>%
+  mutate(feature_1 = ifelse(prefix.x == "T", feature.x, feature_map[feature.x]),
+         feature_2 = ifelse(prefix.y == "T", feature.y, feature_map[feature.y]),
          feature_1 = gsub("/","\n", feature_1),
-         feature_2 = ifelse(is.na(compound_name.y), feature.y, compound_name.y),
-         feature_2 = gsub("/","\n", feature_2),)
+         feature_2 = gsub("/","\n", feature_2),
+         feature_1 = paste0(feature_1, superscript.x),
+         feature_2 = paste0(feature_2, superscript.y))
 
 edges <- df %>% select(feature_1, feature_2, edge_weight, r)
-nodes <- rbind(df %>% select(feature_1, prefix.x) %>% rename(name = feature_1, Omic = prefix.x),
-               df %>% select(feature_2, prefix.y) %>% rename(name = feature_2, Omic = prefix.y)) %>% unique() %>% 
+nodes <- rbind(df %>% select(feature_1, prefix.x,feature_x) %>% rename(name = feature_1, Omic = prefix.x, raw = feature_x),
+               df %>% select(feature_2, prefix.y, feature_y) %>% rename(name = feature_2, Omic = prefix.y, raw = feature_y)) %>% unique() %>% 
+         left_join(feature_enrichment_group, by = "raw") %>% 
          mutate(omic = prefix_mapping[Omic])
 ```
 
+```{r, fig.width=10, fig.height=10}
 
-```{r, fig.width=6, fig.height=5}
-
-g <- tidygraph::tbl_graph(edges = edges, nodes = nodes, directed = F) 
+g <- tidygraph::tbl_graph(edges = edges, nodes = nodes, directed = F) %>%
+  activate(edges) %>% mutate(distance = 1 / edge_weight)
 layout <- create_layout(g, layout = 'igraph', algorithm = 'nicely')
-
+layout <- create_layout(g, layout = "stress", weights = distance)
 p1 <-ggraph(layout) + 
-    geom_edge_fan(aes(color = r), alpha = 0.3, width = 2, position = "jitter", label_dodge = T) +
-    #scale_edge_color_gradient(low = "grey90", high = "grey30") +  
-    scale_edge_color_gradient2(low = "#2a428b", mid = "#eff7f6", high = "#BF3C6F", midpoint = 0, 
-                              limits = c(-1, 1), name = "R") +
-    geom_node_point(aes(fill = omic), size = 6, shape = 21, alpha = 0.9) + 
-    geom_node_text(aes(label = name), repel = TRUE, size = 4.5, check_overlap = T) +
-    scale_fill_manual(values = c("Metabolite" = "grey30", "Genus" = "grey60")) + 
-    #scale_color_manual(values = c("Metabolite" = "#f4a261", "Genus" = "#2a9d8f")) + 
-    labs(edge_color = "R", fill = "Omic") + 
-    theme_void() + theme(legend.position = 'bottom')
+    geom_edge_fan(aes(color = r),  width = 2, position = "jitter", label_dodge = T) +
+  
+    scale_edge_color_gradient2(low = "#2166AC", mid = "#eff7f6", high = "#B2182B", midpoint = 0, limits = c(-1, 1), name = "R") +
+    geom_node_point(aes(shape = omic, fill = enrichment_direction), size = 6, alpha = 0.9) + 
+    scale_shape_manual(values = c("Metabolite" = 24, "Genus" = 21, "Blood Test" = 22)) + 
+    geom_node_label(aes(label = name), repel = TRUE, size = 4, check_overlap = T, force = 100,  segment.color = NA) +
+    scale_fill_manual(values = palette) + scale_color_manual(values = palette) + 
+    labs(edge_color = "R", shape = "Omic", fill = "Enrichment direction") + 
+    theme_void() + #theme(legend.position = 'top') + 
+    theme(legend.text=element_text(size=11), legend.title = element_text(size=12))
 p1
 ```
 
 ```{r}
-ggdata <- data %>% select(all_of(c("patient_id",module$features))) %>% 
-  tidyr::pivot_longer(- patient_id, names_to = "feature", values_to = "value") %>% 
-  mutate(feature = gsub(".*__", "", feature)) %>% 
-  left_join(compound_names, by = c("feature" = "compound_id")) %>% 
-  left_join(mdata %>% select(patient_id, is_fap), by = "patient_id") %>%
-  mutate(feature = ifelse(is.na(compound_name), feature, compound_name),
-         feature = gsub("/","\n", feature),
-         omic = ifelse(is.na(compound_name), "Genus", "Metabolite")) %>% unique()
+p1_legend <- cowplot::get_legend(p1)
+#ggsave(file="figures/f3/f3_minttea_legend.svg", plot=p1_legend, width=5, height=5)
+```
+```{r}
+library(RCy3)
+cytoscapePing()
+edges_cs <- edges %>% rename(source = 1, target = 2) %>% mutate(r_direction = ifelse(r> 0, "Positive", "Negative"))
+nodes_cs <- nodes %>% rename(id = 1, type = 2, label = enrichment_direction) 
+            
 
-p2 <- ggplot(ggdata %>% filter(omic == "Genus"), aes(x = reorder(feature,-value), y = value, fill = is_fap)) +
-  geom_boxplot(alpha = 0.6, outlier.shape = NA) + 
-   geom_jitter(aes(color = is_fap),color = "black", size = 1,alpha = 0.3,
-    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8)) +
-  #geom_point(position = position_dodge(), alpha = 0.7) +
-  #geom_point(position = "jitter", alpha = 0.7) +
-  scale_fill_manual(values = palette) + 
-  labs(subtitle = "Genus", y = "RA (CLR)", fill = "Phenotype", x= NULL) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +coord_flip()
-
-p3 <- ggplot(ggdata %>% filter(omic == "Metabolite"), aes(x = reorder(feature,-value), y = value, fill = is_fap)) +
-  geom_boxplot(alpha = 0.6, outlier.shape = NA) + 
-   geom_jitter(aes(color = is_fap),color = "black", size = 1,alpha = 0.3,
-    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8)) +
-  scale_fill_manual(values = palette) + 
-  labs(subtitle = "Metabolite", y = "Peak Area", fill = "Phenotype",x = NULL) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +coord_flip()
+# Export to CytoScape
+createNetworkFromDataFrames(
+  nodes = nodes_cs,
+  edges = edges_cs,
+  title = "minttea_module_4",
+  collection = "minttea_module_4"
+  )
 ```
 
-```{r, fig.height=5, fig.width=7}
-ggdata <- data %>% select(all_of(c("patient_id",module$features)))
-
-results <- get_binary_predictability(ggdata, mdata, "patient_id", c("is_fap"))
-df_roc_plot <- results$plots$is_fap$data %>% mutate(shuffled_flag == "True model", "", )
-
-aucs <- results$results
-auc_true <- paste(round(aucs$mean_auc_true_model,2), "\u00B1", round(aucs$sd_auc_true_model,2))
-auc_null <- paste(round(aucs$mean_auc_shuffled_model,2), "\u00B1", round(aucs$sd_auc_shuffled_model,2))
-label <- paste0("AUC (True model): ", auc_true, "\nAUC (Null models): ", auc_null)
-
-p4 <- ggplot(df_roc_plot, aes(x = x, group = shuffle_index)) +
-  geom_path(aes(y = `median`, color = shuffled_flag), size =1.2) + 
-  geom_abline(slope=1, intercept = 1, linetype = "dashed", alpha=0.9, color = "grey10", size = 1) + 
-  scale_x_reverse() + #coord_equal() + 
-  labs(x = 'Specificity', y = 'Sensitivity', fill = "", color = "", alpha = "", subtitle = label) +
-  geom_ribbon(aes(ymin = lower, ymax = upper, fill = shuffled_flag, alpha = shuffled_flag)) +
-  scale_alpha_manual(values = c('Null models' = 0.2, 'True model' = 0.4)) +
-  scale_color_manual(values = c('Null models' = 'grey60', 'True model' = '#2F5A91')) +
-  scale_fill_manual(values = c('Null models' = 'grey60', 'True model' = '#2F5A91')) +theme(legend.position = "bottom")
-```
-
-```{r fig.height=7, fig.width=15}
-boxplots <- (p2/p3) + plot_layout( guides = "collect") & theme(legend.position = 'bottom')
-
-p1  + boxplots + p4+
-plot_layout(widths = c(1,0.9,1.1)) + 
-  plot_annotation(tag_levels = 'A') & 
-  theme(plot.tag = element_text(size = 14))
-```
-
-
-
-
+## 3.6 Visualize feature values 
 
 ```{r}
-matched_compounds <- read.csv( "processed_data/compound_id_to_ko.csv")
-pathways <- read.csv("processed_data/pathways_annotated.csv")
-
-pathway_metabolite_overlap <- pathways %>% filter(kegg_id %in% matched_compounds$kegg_id) %>% count(pathway_id) %>% 
-                              filter(n >=3) %>% pull(pathway_id)
-pathway_sizes <- pathways %>% filter(pathway_id %in% pathway_metabolite_overlap) %>% group_by(pathway_id) %>% summarise(pathway_size = n()) %>% ungroup()
-pathways_filt <- pathways %>% filter(pathway_id %in% pathway_metabolite_overlap) %>% 
-                 group_by(pathway_name) %>% mutate(n = n()) %>% ungroup() %>%
-                 filter(n <= 200)
-                
-```
-
-```{r}
-ggplot(pathway_sizes, aes(x= pathway_size)) + geom_density() + scale_x_log10() +
-  geom_vline(xintercept = 200)
-```
-
-```{r}
-a<- pathways %>% filter(kegg_id %in% target_kegg)
+cor_df <- cor_df %>% left_join(nodes %>% select(raw, name), by = c("feature.x" = "raw")) %>% 
+          left_join(nodes %>% select(raw, name), by = c("feature.y" = "raw")) %>% 
+          add_sigstars(fdr_p_value = "fdr") %>% 
+          mutate(label = paste0("R = ", round(r,3), ", FDR: ", significance))
 ```
 
 
-```{r}
-target_metabolites <- grep("M__",module$features, value = T) %>% gsub("M__","", .)
-target_kegg <- matched_compounds %>% filter(compound_id %in% target_metabolites) %>% pull(kegg_id)
-all_metabolites <- pathways_filt$kegg_id %>% unique()
-```
+```{r, fig.height=10, fig.width=10}
+ggdata <- data %>% select(patient_id,all_of(nodes$raw)) %>% left_join(mdata_all, by = "patient_id")
+edges <- edges %>% arrange(feature_1 , feature_2)
 
-```{r}
-# Get unique pathways
-unique_pathways <- unique(pathways_filt$pathway_name )
-
-# Initialize results
-ora_results <- data.frame(pathway = character(),
-                          n_overlap = numeric(),
-                          pathway_size = numeric(), 
-                          p_value = numeric(),
-                          stringsAsFactors = FALSE)
-
-for (pw in unique_pathways) {
-  pw_metabolites <- pathways$kegg_id[pathways$pathway_name == pw]
-  
-  # Construct contingency table
-  a <- sum(target_kegg %in% pw_metabolites)                  # in cluster AND in pathway
-  b <- sum(target_kegg %in% all_metabolites & !(target_kegg %in% pw_metabolites))  # in cluster NOT in pathway
-  c <- sum(!(all_metabolites %in% target_kegg) & (all_metabolites %in% pw_metabolites))    # not in cluster BUT in pathway
-  d <- sum(!(all_metabolites %in% target_kegg) & !(all_metabolites %in% pw_metabolites))   # neither
-
-  contingency <- matrix(c(a, b, c, d), nrow = 2)
-
-  # Fisher's test
-  test <- fisher.test(contingency, alternative = "greater")
-
-  # Save result
-  ora_results <- rbind(ora_results,
-                       data.frame(pathway = pw,
-                                  n_overlap = a,
-                                  pathway_size = length(pw_metabolites),
-                                  p_value = test$p.value,
-                                  stringsAsFactors = FALSE))
+p_list = list()
+for (i in 1:nrow(edges)){
+  f_pair <- edges[i, 1:2] %>% unlist()
+  row <- cor_df %>% filter(name.x == f_pair[1], name.y == f_pair[2]) %>% unlist()
+  ggp <- ggplot(ggdata, aes_string(row[["feature.x"]], row[["feature.y"]])) + 
+         geom_point(aes(color = phenotype_binary), alpha= 0.5) + 
+      labs(subtitle = row[["label"]], x = row[["name.x"]], y = row[["name.y"]]) + 
+       geom_smooth(method = "lm", color = "black", linetype = "dashed") +
+       scale_color_manual(values =palette) + theme(legend.position = "none") + 
+    theme_bw(base_size = 8) + theme(legend.position = "none")
+  p_list[[i]] = ggp
 }
+p <- cowplot::plot_grid(plotlist = p_list)
+p
+#ggsave("figures/f3/residual_correlation.svg", p, height = 10, width = 10)
+```
 
-# Adjust p-values
-ora_results$p_adj <- p.adjust(ora_results$p_value, method = "fdr")
+```{r, fig.height=10, fig.width=10}
+ggdata <- combined %>% select(patient_id,all_of(nodes$raw)) %>% left_join(mdata_all, by = "patient_id")
 
+p_list = list()
+for (i in 1:nrow(edges)){
+  f_pair <- edges[i, 1:2] %>% unlist()
+  row <- cor_df %>% filter(name.x == f_pair[1], name.y == f_pair[2]) %>% unlist()
+  ggp <- ggplot(ggdata, aes_string(row[["feature.x"]], row[["feature.y"]])) + 
+         geom_point(aes(color = phenotype_binary), alpha= 0.5) + 
+    ggpubr::stat_cor(method = "spearman", size = 2) + 
+      labs(x = row[["name.x"]], y = row[["name.y"]]) + 
+       geom_smooth(method = "lm", color = "black", linetype = "dashed") +
+       scale_color_manual(values =palette) + theme(legend.position = "none") + 
+    theme_bw(base_size = 8) + theme(legend.position = "none")
+  p_list[[i]] = ggp
+}
+p <- cowplot::plot_grid(plotlist = p_list)
+p
+#ggsave("figures/f3/feature_correlation.svg", p, height = 10, width = 10)
+```
+
+# 4. Export feature lists
+```{r}
+lr_features <- ggdata %>% mutate(prefix = gsub("__.*","", feature_orig),
+                                 feature_type = prefix_mapping[prefix]) %>%  
+               select(feature_name, feature, feature_type,label, direction) %>% 
+               tidyr::pivot_wider(names_from = "label", values_from = "direction", names_prefix = "LR ")
+
+minttea_features <- nodes %>% rename(feature_name = 1, feature = 3, feature_type = 5, MintTea = 4) %>% select(-Omic) %>% 
+                    mutate(feature = gsub("[A-Z]__", "", feature), 
+                           feature_name = remove_superscript(feature_name))
+
+multi_omic_features <- lr_features %>% full_join(minttea_features, by = c("feature_name", "feature", "feature_type"))
+multi_omic_features %>% head()
+#write.csv(multi_omic_features, "figures/f3/f3_feature_lists_residuals.csv",  row.names = F)
+```
+
+```{r}
+id_cols <- c("feature_name", "feature", "feature_type")
+maaslin_features <- read.csv("figures/f1/f1_feature_lists.csv") %>% select(3,1,4,2)
+metabolomic_features <- read.csv("figures/f2/f2_feature_lists.csv")
+multi_omic_features <- read.csv("figures/f3/f3_feature_lists_residuals.csv")
+df <- maaslin_features %>%  full_join(metabolomic_features, by = id_cols) %>% 
+      full_join(multi_omic_features, by = id_cols)
+df$n_models <- rowSums(!is.na(df)) - length(id_cols)
+df$max_models <- ifelse(df$feature_type == "Blood Test", 3, 4)
+df$perc_models <- df$n_models/df$max_models
+colnames(df) <- c("feature_name", "feature", "feature_type","F1","F2",
+                  "F3_metabolomics", "F3_taxonomy",
+                  "F3_blood", "F3_combined", "F3_minttea", 
+                  "n_models", "max_models", "perc_models")
+#write.csv(df, "figures/complete_feature_lists_v2.csv",  row.names = F)
 ```
 
 
-
+```{r}
+ggdata <- data %>% select(patient_id,all_of(nodes$raw)) %>% 
+          left_join(mdata_all, by = "patient_id")
+```
 

@@ -8,7 +8,6 @@ library(dplyr)
 library(ggplot2)
 library(tidyr)
 library(tibble)
-library(patchwork)
 
 theme_set(theme_bw(base_size = 15))
 source("code/R/categorical_metadata_analysis.R")
@@ -20,9 +19,10 @@ source("code/R/statistics.R")
 ```{r}
 palette_df <- read.csv("metadata/clean/project_palette.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
 palette <- setNames(palette_df$color, palette_df$label)
+label_order <- c("Classical FAP", "Non-classical FAP", "Control")
 ```
 
-## Data import
+# 1. Data import
 ```{r}
 taxa_df <- read.csv("processed_data/genus_ra_non_rare.csv")
 colnames(taxa_df) <- colnames(taxa_df) %>% gsub(".*g__","",.)
@@ -33,37 +33,36 @@ colnames(taxa_df_raw) <- colnames(taxa_df_raw) %>% gsub(".*g__","",.)
 ```
 
 ```{r}
-mdata_all <- read.csv("metadata/clean/core_metadata_with_mean.csv") %>% 
+regressors <- c("bmi", "age", "gender")
+mdata_all <- read.csv("metadata/clean/core_metadata_with_mean.csv") %>% filter(phenotype != "Fatty Liver") %>% 
          mutate(phenotype_binary = ifelse(phenotype %in% c("Classical FAP", "Non-classical FAP"), "FAP", "Control"),
                 phenotype_binary = factor(phenotype_binary , levels = c("FAP", "Control")),
-                gender = ifelse(gender == "Female", 1,0))
+                patient_id = gsub(" Cohort", "", patient_id),
+                gender = ifelse(gender == "Female", 1,0)) 
+
+
 patient_mdata <- mdata_all %>% select(-sample_id, -batch) %>% unique()
 mdata <- mdata_all %>% filter(sample_id %in% taxa_df$sample_id)
 mdata %>% head()
 ```
 
-
-# Analysis
-## Taxonomic composition
-
-### Identify patients with 2 samples
 ```{r}
-patients_cross_batch <- mdata %>% filter(batch == "Mean RA") %>% pull(patient_id)
-mdata_subset <- mdata_all %>% 
-                mutate(patient_id_base = patient_id,
-                       patient_id = ifelse(patient_id %in% patients_cross_batch,
-                                           paste0(patient_id, " (",gsub("Batch ","", batch),")"),
-                                           patient_id)) %>%
-                select(sample_id, phenotype, phenotype_binary, patient_id, patient_id_base, is_surgery)
+mdata %>% count(phenotype)
 ```
 
-### Phylum level
+# 2. Analysis
+## 2.1 Phylum level relative abundance
 ```{r}
 path <- paste0("qiime/combined/6_Taxonomy_GTDB/feature_table.tsv")
 relab<- read.table(path , header = TRUE, sep = "\t")
 colnames(relab) <- format_sample_ids(colnames(relab))
-relab_phy <- relab %>% mutate(phylum = gsub(".*p__","",taxon),phylum = gsub(";c__.*", "", phylum)) %>% 
-             filter(phylum != "") %>% select(-taxon) %>% group_by(phylum) %>% summarise_all(sum) %>% ungroup() %>% 
+
+firmicutes <- c("Firmicutes","Firmicutes_A","Firmicutes_B","Firmicutes_C" )
+relab_phy <- relab %>% mutate(phylum = gsub(".*p__","",taxon),
+                              phylum = gsub(";c__.*", "", phylum),
+                              phylum = ifelse(phylum %in% firmicutes, "Firmicutes", phylum)) %>% 
+             filter(phylum != "") %>% 
+             select(-taxon) %>% group_by(phylum) %>% summarise_all(sum) %>% ungroup() %>% 
              column_to_rownames("phylum") %>%  mutate_all(~ . / sum(.)) %>% 
              t() %>% as.data.frame()
 
@@ -76,7 +75,8 @@ ggdata <- relab_phy %>% rownames_to_column("sample_id") %>%
           tidyr::pivot_longer(cols = -sample_id, names_to = "taxon", values_to = "ra") %>% 
           mutate(taxon = ifelse(taxon %in% non_rare_phyla, taxon, "Other")) %>%
           group_by(sample_id, taxon) %>% summarise(ra = sum(ra)) %>% ungroup() %>%
-          left_join(mdata_subset,by = "sample_id")
+          inner_join(mdata_all,by = "sample_id") %>% 
+          group_by(patient_id ,phenotype, phenotype_binary, taxon )  %>% summarise(ra = mean(ra)) %>% ungroup()
 
 tmp_palette <- colorRampPalette(RColorBrewer::brewer.pal(9,name = 'RdYlGn'))(length(non_rare_phyla))
 names(tmp_palette) <- non_rare_phyla
@@ -84,12 +84,15 @@ tmp_palette["Other"] <- "grey"
 
 ggdata <- ggdata %>% mutate(taxon = factor(taxon, levels = c(non_rare_phyla, "Other")))
 ```
-```{r fig.height=8, fig.width=20, fig.align='center'}
-ggp <- plot_abundance_barplot(ggdata, tmp_palette) +
-facet_wrap(~phenotype_binary, scales = "free_x", ncol =1) + theme(legend.position = "none")
-plot(ggp)
+```{r}
+phylum_ra <- plot_abundance_barplot(ggdata, tmp_palette) + 
+  facet_grid(~phenotype_binary, scales = "free_x", space = "free") + labs(fill = "Phylum") + 
+        theme_classic(base_size = 10)  +
+        theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+              strip.background =element_rect(fill="grey95"),
+                strip.text = element_text(size = 10), legend.position = "top") + guides(fill = guide_legend(ncol = 4))
+phylum_ra
 ```
-
 
 ```{r}
 ggdata_for_boxplot <- ggdata %>% filter(taxon != "Other") %>% 
@@ -97,21 +100,23 @@ ggdata_for_boxplot <- ggdata %>% filter(taxon != "Other") %>%
                       group_by(phenotype_binary,phenotype, patient_id, taxon) %>% summarise(ra = mean(ra)) %>% ungroup() %>% unique()
 ```
 
-```{r}
-# Perform Mann-Whitney test in a for loop
-results_df <- data.frame(taxon = character(), p_value = numeric())
-for (phylum in non_rare_phyla) {
-  test_data <- ggdata_for_boxplot %>% filter(taxon == phylum, phenotype != "Fatty Liver")
-  test_result <- wilcox.test(ra ~ phenotype_binary, data = test_data)
-  results_df <- rbind(results_df, data.frame(taxon = phylum, p_value = test_result$p.value))
-}
-results_df %>% add_significance()
-```
 ```{r fig.height=6, fig.width=12, fig.align='center'}
-ggplot(ggdata_for_boxplot %>% filter( phenotype != "Fatty Liver"),
-       aes(x = taxon, y = ra, fill = phenotype_binary, color = phenotype_binary)) + 
-       plot_box_and_jitter(palette) + 
-       labs(x = "Phylum", y = "Relative abundance", fill = "Phenotype")
+test_data <- ggdata_for_boxplot %>% left_join(patient_mdata %>% select(all_of(c("patient_id", regressors))), by = "patient_id") 
+result <- data.frame()
+for (taxa in unique(test_data$taxon)){
+  taxon_result <- perm_ancova_pairs(df = test_data %>% filter(taxon == taxa), 
+                     X = "ra", group =  "phenotype_binary", covariates = regressors) %>% add_significance("p_value_perm_pair") %>% 
+                  mutate(feature = taxa)
+  result <- rbind(result, taxon_result)
+}
+result
+
+phyla_ra_box <- ggplot(ggdata_for_boxplot %>% mutate(phenotype = factor(phenotype, levels = label_order)),
+                       aes(x = taxon, y = ra, fill = phenotype_binary, color = phenotype_binary)) + 
+                plot_box_and_jitter(palette, legend_position = "top") + ylim(-0.01, 0.9) + 
+                labs(x = "Phylum", y = "Relative\nabundance", fill = "Phenotype")
+phyla_ra_box
+#ggsave(file="figures/f1/f1_supp_phyla_ra.svg", plot=phyla_ra_box, width=12, height=4)
 ```
 
 
@@ -127,123 +132,67 @@ calculate_phyla_ratio <- function(df,  num, denom){
 ```
 
 
-
 ```{r fig.height=3, fig.width=4, fig.align='center'}
-
 num <- c("Firmicutes")
 denom <- c("Bacteroidota")
 
 res <- calculate_phyla_ratio(ggdata_for_boxplot, num, denom) %>% 
-       mutate(phenotype = factor(phenotype, levels = c("Classical FAP","Non-classical FAP","Fatty Liver","Control")))
+       mutate(phenotype = factor(phenotype, levels = label_order),
+              log2_ratio = log2(ratio))#, patient_id = paste(patient_id, "Cohort"))
 
-fap_ratio <- wilcox_test_by_pair(res %>% filter(phenotype != "Fatty Liver"), "phenotype_binary", "ratio ~ phenotype_binary", FALSE) %>% mutate(cat = "ratio")
-fap_num <- wilcox_test_by_pair(res %>% filter(phenotype != "Fatty Liver"), "phenotype_binary", "numerator ~ phenotype_binary", FALSE) %>% mutate(cat = "numerator")
-fap_denom <- wilcox_test_by_pair(res %>% filter(phenotype != "Fatty Liver"), "phenotype_binary", "denominator  ~ phenotype_binary", FALSE) %>% mutate(cat = "denominator")
+res %>% group_by(phenotype) %>% summarise(mean_ratio = mean(ratio))
 
-rbind(fap_ratio, fap_num, fap_denom) %>% add_significance()
-
-ggp_fap <- ggplot(res %>% filter(phenotype != "Fatty Liver"), aes(phenotype, log2(ratio), fill = phenotype, color = phenotype)) + 
-             plot_box_and_jitter(palette) +  
-            labs(x = "Phenotype", y = "log2[ Pylum Ratio ]", subtitle = "FAP vs Control")
-plot(ggp_fap)
-
-```
-
-```{r}
 regressors <- c("bmi", "age", "gender")
+ggdata <- res %>% left_join(patient_mdata %>% select(all_of(c("patient_id", regressors))), by = "patient_id")
+perm_ancova_pairs(df = ggdata, X = "ratio", group =  "phenotype", covariates = regressors) %>% add_significance("p_value_perm_pair")
 
-ggdata <- res %>% mutate(patient_id = paste(patient_id, "Cohort")) %>% left_join(patient_mdata) %>%
-          mutate(ratio =log2(ratio)) %>% 
-          select(all_of(c(regressors, "ratio", "phenotype_binary", "phenotype")))
-```
-
-```{r, fig.width=5, fig.height = 4}
-results <- test_wilcox_residuals(ggdata %>% filter(phenotype != "Fatty Liver"), regressors,"ratio", "phenotype_binary")
-p1 <- results[[1]]
-print(paste("Wilcoxon test p-value:", round(results[[1]],10)))
-results[[2]] + scale_color_manual(values = palette) +
-  labs(x = "Phenotype") + scale_x_discrete(limits = c("FAP", "Control"))
-```
-
-```{r, fig.width=5, fig.height = 4}
-results <- test_wilcox_residuals(ggdata %>% filter(phenotype_binary != "FAP"), regressors,"ratio", "phenotype")
-p2 <- results[[1]]
-p.adjust(c(p1,p2))
-print(paste("Wilcoxon test p-value:", round(results[[1]],10)))
-results[[2]] + scale_color_manual(values = palette) +
-  labs(x = "Phenotype") + scale_x_discrete(limits = c("Fatty Liver", "Control"))
-```
-
-
-```{r fig.height=3, fig.width=4, fig.align='center'}
-liver_ratio <- wilcox_test_by_pair(res %>% filter(phenotype_binary != "FAP"), "phenotype", "ratio ~ phenotype", FALSE)
-liver_num <- wilcox_test_by_pair(res %>% filter(phenotype_binary != "FAP"), "phenotype", "numerator ~ phenotype", FALSE)
-liver_denom <- wilcox_test_by_pair(res %>% filter(phenotype_binary != "FAP"), "phenotype", "numerator ~ phenotype", FALSE)
-rbind(liver_ratio, liver_num, liver_denom) %>% add_significance()
-
-ggp_liver <- ggplot(res %>% filter(phenotype_binary != "FAP"), aes(phenotype, log2(ratio), fill = phenotype, color = phenotype)) +
+fb_ratio <- ggplot(res, aes(phenotype, log2_ratio, fill = phenotype, color = phenotype)) + 
              plot_box_and_jitter(palette) + 
-             labs(x = "Phenotype", y = "log2[ Pylum Ratio ]", subtitle = "Fatty Liver vs Control")
+             scale_x_discrete(labels = function(x) gsub(" ", "\n" ,x)) + 
+             ylim(min(res$log2_ratio)-0.1, 1.1*max(res$log2_ratio)) + # leave space for significance starts
+             theme(axis.text.x = element_text(size = 8)) + 
+            labs(x = "Phenotype", y = "F/B Ratio [log2]")
+plot(fb_ratio)
+
 ```
 
-### Genus level
-```{r}
+## 2.2 Alpha diversity
 
-ggdata <- taxa_df_raw %>% tidyr::pivot_longer(cols = -sample_id, names_to = "genus", values_to = "ra") %>% 
-          left_join(mdata_subset,by = "sample_id")
-
-genera <- ggdata$genus %>% unique() %>% sort()
-rare_taxa <- ggdata %>% group_by(sample_id, is_surgery,phenotype_binary,phenotype, patient_id_base, patient_id) %>%
-                summarise(ra = 1-sum(ra)) %>% ungroup %>% mutate(genus = "Other")
-ggdata <- rbind(ggdata, rare_taxa)
-
-tmp_palette <- colorRampPalette(RColorBrewer::brewer.pal(9,name = 'RdYlGn'))(length(genera))
-names(tmp_palette) <- genera
-tmp_palette["Other"] <- "grey"
-
-ggdata <- ggdata %>% mutate(genus = factor(genus, levels = c(genera, "Other")))
-```
-```{r fig.height=8, fig.width=20, fig.align='center'}
-ggp <- plot_abundance_barplot(ggdata, tmp_palette, fill_var = "genus") +
-facet_wrap(~phenotype_binary, scales = "free_x", ncol =1) + labs(fill = "Genus")
-plot(ggp)
-```
-
-## Alpha diversity
 ```{r fig.height=4, fig.width=10, fig.align='center'}
-label_order <- c("Control", "Non-classical FAP", "Classical FAP") %>% rev()
-shannon_index <- vegan::diversity(taxa_df %>% tibble::column_to_rownames("sample_id"), index = "shannon")
-shannon_df <- data.frame(sample_id = names(shannon_index),shannon = shannon_index) %>% 
-  left_join(mdata, by = "sample_id") %>% mutate(phenotype = factor(phenotype, levels = label_order))
+alpha_div_metrics <- c("shannon",  "simpson")
+ancova <- data.frame()
+ggp_list <- list()
 
-wilcox_test_by_pair(shannon_df, "phenotype", "shannon ~ phenotype", FALSE) %>% add_significance()
+for (metric in alpha_div_metrics){
+  ## Data preparation
+  div <- vegan::diversity(taxa_df %>% tibble::column_to_rownames("sample_id"), index = metric)
+  div_df <- data.frame(sample_id = names(div),metric = div) %>% 
+            left_join(mdata, by = "sample_id") %>% 
+            mutate(phenotype = factor(phenotype, levels = label_order))
+  
+  ancova_metric <- perm_ancova_pairs(df = div_df, X = "metric", group =  "phenotype", covariates = regressors)
+  ancova <- rbind(ancova, ancova_metric %>% mutate(feature = metric))
 
-ggp1 <- ggplot(shannon_df, aes(phenotype, shannon, fill = phenotype, color = phenotype)) + 
-  plot_box_and_jitter(palette = palette) +
-  labs(x = "Phenotype", y = "Shannon Index", fill = "Phenotype") 
+  ## Visualization
+  y_lab <- paste(stringr::str_to_title(metric), "diversity")
+  
+  ggp <- ggplot(div_df, aes(phenotype, metric, fill = phenotype, color = phenotype)) + 
+    plot_box_and_jitter(palette = palette) +
+    labs(x = "Phenotype", y = y_lab) + theme(legend.position = "none") + 
+    scale_x_discrete(labels = function(x) gsub(" ", "\n" ,x)) + 
+    theme(axis.text.x = element_text(size = 8)) + 
+    ylim(min(div_df$metric)*0.95, max(div_df$metric)*1.1) # leave space for sig starts
 
-ggp2 <- ggplot(shannon_df, aes(phenotype, shannon, fill = is_surgery, color = is_surgery)) + 
-  plot_box_and_jitter(palette = palette) + theme(legend.position = "right") + 
-  labs(x = "Phenotype", y = "Shannon Index", fill = "Surgery", color = "Surgery")
-plot(ggp1 + ggp2)
+  ggp_list[[metric]] <- ggp
+}
+ancova  %>% add_significance(pval_col = "p_value_perm_pair")
+ggp_list[["shannon"]]
+ggp_list[["simpson"]]
+
 ```
 
-```{r fig.height=4, fig.width=8, fig.align='center'}
-shannon_df <- shannon_df %>% mutate(surgery_type = factor(surgery_type, levels = rev(c("No surgery", "Subtotal colectomy", "Pouch"))))
-p3 <- ggplot(shannon_df, aes(phenotype, shannon, fill = surgery_type, color = surgery_type)) + 
-  plot_box_and_jitter(legend_position = "right", palette = palette) + 
-  labs(x = "Phenotype", y = "Shannon Index", fill = "Surgery Type", color = "Surgery Type") 
-plot(p3)
-```
 
-```{r, fig.width=5, fig.height = 4}
-results <- test_wilcox_residuals(shannon_df, regressors,"shannon", "phenotype_binary")
-print(paste("Wilcoxon test p-value:", round(results[[1]],10)))
-results[[2]] + scale_color_manual(values = palette) +
-  labs(x = "Phenotype") + scale_x_discrete(limits = c("FAP", "Control"))
-```
-
-## Beta diversity
+## 2.3 Beta diversity
 ```{r}
   genus_dist <- vegan::vegdist(taxa_df %>% tibble::column_to_rownames("sample_id"), method = "bray") %>% 
                 as.matrix() %>% as.data.frame() %>% tibble::rownames_to_column("sample_id")
@@ -254,172 +203,143 @@ results[[2]] + scale_color_manual(values = palette) +
   print(abd)
   print(pbd)
 ```
+
 ```{r}
-res <- get_permanova(disct_metadata = mdata,  
+res <- get_permanova(disct_metadata = mdata %>% mutate(phenotype = factor(phenotype, levels = label_order)),  
                       dist_matrix = genus_dist,
                       dist_metric_name = "Bray-Curtis",
                       sample_id_column = 'sample_id', 
                       metadata_cols_to_analyze = c("phenotype"),
                       fdr_threshold = 0.1,
-                      pcoa_fill = palette) 
-```
-```{r}
-res$plots[["phenotype_pc1&pc2"]] + 
-           labs(fill = "", title = "", color = "") 
-```
+                      pcoa_fill = palette)
 
-
-## Differntial abundance 
-```{r}
-
-mdata <- mdata %>% mutate(phenotype = factor(phenotype, levels = label_order))
-diff_ra_results <- run_analysis_diff_abundance(taxa_df, mdata, palette, 
-                           metadata_cols_to_analyze = c("phenotype_binary"),
-                           metadata_cols_fix_effects = c(),
-                           metadata_cols_rand_effects = c(), 
-                           boxplot_x_order = label_order)
-
-
+beta_div <- res$plots[["phenotype_pc1&pc2"]] + 
+           labs(fill = "", title = "", color = "") + 
+           theme(legend.position = c(0.8,0.15),
+                 legend.background = element_rect(colour = NA, fill = NA))  + coord_fixed() 
+beta_div
 ```
 
-```{r}
-fix_vars <- c("age", "bmi", "gender")
-plot_list <- list()
+## 2.4 Genus level relative abundance
 
+```{r}
 ## Compare Control subjects to FAP patients from both classical and non-classical FAP
-fap_vs_non_fap <- get_differential_abundance(taxa_df, mdata %>% mutate(phenotype_binary = factor(phenotype_binary, levels = c("FAP", "Control"))),
+labels <- c("FAP", "Control")
+fap_vs_control <- get_differential_abundance(taxa_df, 
+                  mdata %>% mutate(phenotype_binary = factor(phenotype_binary, levels = labels)),
                                              metadata_cols_to_analyze = c("phenotype_binary"),
-                                             metadata_cols_fix_effects = fix_vars)
-plot_list[["FAP vs Control"]] <- fap_vs_non_fap$plots
-fap_vs_non_fap <- fap_vs_non_fap$all_results %>% mutate(contrast = "FAP vs Control")
+                                             metadata_cols_fix_effects = regressors)
+  
+ggdata <- fap_vs_control$all_results %>% filter(! metadata %in% regressors) %>% 
+           mutate(is_significant = FDR < 0.05, 
+           is_coef = abs(coef) > 1,
+           is_highlight = is_significant & is_coef,
+           label = ifelse(is_highlight, feature, ""),
+           color = ifelse(is_highlight & coef < 1, labels[[1]], labels[[2]]),
+           color = ifelse(!is_highlight,"Non-Significant", color))
 
-## Compare Classical and non classical FAP patients
-within_fap <- get_differential_abundance(taxa_df, mdata %>% filter(phenotype != "Control"), metadata_cols_to_analyze = c("phenotype"),
-                                         metadata_cols_fix_effects = fix_vars)
-plot_list[["Classical vs Non-classical FAP"]] <- within_fap$plots
-within_fap <- within_fap$all_results %>% mutate(contrast = "Classical vs Non-classical FAP")
-
-## Compare Classical and non classical FAP patients (subset of patients who went through surgery)
-within_fap_w_surgery <- get_differential_abundance(taxa_df, mdata %>% filter(is_surgery), metadata_cols_to_analyze = c("phenotype"),
-                                                   metadata_cols_fix_effects = fix_vars)
-plot_list[["Classical vs Non-classical FAP (surgery)"]] <- within_fap_w_surgery$plots
-within_fap_w_surgery <- within_fap_w_surgery$all_results %>% mutate(contrast = "Classical vs Non-classical FAP (surgery)")
-
-# Prepare data for plotting
-ggdata <- prepare_maaslin2_for_volcano(rbind(within_fap,  fap_vs_non_fap, within_fap_w_surgery), metadata_vars = c("phenotype_binary", "phenotype"))
-signif_labs <- ggdata %>% filter(is_highlight) %>% pull(label) %>% unique()
+#ggdata <- prepare_maaslin2_for_volcano(fap_vs_control$all_results, metadata_vars = c("phenotype_binary"))
+volcano <- plot_volcano(ggdata, n_label_overlaps = 7, label_size = 3,fdr_min = 0.05 ) + 
+         scale_color_manual(values = palette) + 
+         theme(legend.position = "top") 
+volcano
+maaslin_features <- ggdata %>% select(feature, color) %>% 
+                                 mutate(feature_name = feature, feature_type = "Genus") %>% 
+                                 rename(`maaslin taxonomy` = color) 
+#write.csv(maaslin_features, "figures/f1/f1_feature_lists.csv",  row.names = F)
 ```
 
-
-```{r, fig.height=6, fig.width=18}
-ggp<- ggplot(ggdata %>% filter(is_highlight) , aes(feature, contrast,  color = color)) +
-      geom_point(aes(size = -log10(FDR))) + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.4)) + 
-      scale_color_manual(values = palette) + #scale_y_reverse() + 
-      labs( y = "Contrast", x = "Genus", color = "Enrichment group")
-plot(ggp)
-```
-
-
-```{r, fig.height=6, fig.width=18}
-ggp<- ggplot(ggdata %>% filter(is_highlight) , aes(feature, contrast,  color = color)) +
-      geom_point(aes(size = -log10(FDR))) + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.4)) + 
-      scale_color_manual(values = palette) + #scale_y_reverse() + 
-      labs( y = "Contrast", x = "Genus", color = "Enrichment group")
-plot(ggp)
-```
-
-
-
-### Volcano plots
-
-```{r, fig.height=6, fig.width=6}
-for (target_contrast in unique(ggdata$contrast)) {
-    ggp <- plot_volcano(ggdata %>% filter(contrast == target_contrast)) + 
-           scale_color_manual(values = palette) + 
-           theme(legend.position = "top") +
-           labs(subtitle = target_contrast)
-    plot(ggp)
-}
-```
-
-### Boxplots
-
+### 2.4.1 Box plots for supplementary
 ```{r}
-target_genera <- ggdata %>% filter(contrast == "Classical vs Non-classical FAP", is_highlight) %>% pull(feature)
-ggdata_boxplot <- taxa_df %>% select(sample_id, target_genera ) %>% 
-                  tidyr::pivot_longer(cols = -sample_id, names_to = "feature", values_to = "ra") %>% 
-                  left_join(mdata_subset, by = "sample_id")  %>% filter(phenotype != "Fatty Liver") %>% 
-                  mutate(phenotype = factor(phenotype, levels = label_order))
-ggp <- ggplot(ggdata_boxplot , aes(phenotype, ra, fill = phenotype, color = phenotype)) + 
-       labs(x= "Phenotype", y = "Relative abundance") + 
-       plot_box_and_jitter(palette)+ facet_wrap(~feature, scales = "free_y")
-plot(ggp)
-ggdata %>% filter(feature %in% target_genera, is_highlight)  %>% select(contrast, feature, FDR,color) %>% add_sigstart(., "FDR")
-```
+target_genera <- ggdata %>% filter(is_highlight) %>% add_sigstars(fdr_p_value = "FDR")
+ann_df <- target_genera %>% select(feature, significance)
 
-```{r, fig.height=5, fig.width=8}
-ggp <- ggplot(ggdata_boxplot , aes(phenotype, ra, fill = is_surgery, color = is_surgery)) + 
-       labs(x= "Phenotype", y = "Relative abundance", fill = "Surgery", color = "Surgery") + 
-       plot_box_and_jitter(palette, 12, "top")+ facet_wrap(~feature, scales = "free_y")
-plot(ggp)
-```
-
-```{r}
-target_genera <- ggdata %>% filter(contrast == "Classical vs Non-classical FAP (surgery)", is_highlight) %>% pull(feature)
-ggdata_boxplot <- taxa_df %>% select(sample_id, target_genera ) %>% 
-                  tidyr::pivot_longer(cols = -sample_id, names_to = "feature", values_to = "ra") %>% 
-                  left_join(mdata_subset, by = "sample_id") %>% filter(phenotype == "Control" | is_surgery) %>% 
-                  mutate(phenotype = factor(phenotype, levels = label_order))
-ggp <- ggplot(ggdata_boxplot , aes(phenotype, ra, fill = phenotype, color = phenotype)) + 
-       labs(x= "Phenotype", y = "Relative abundance") + 
-       plot_box_and_jitter(palette)+ facet_wrap(~feature, scales = "free_y", ncol =2)
-plot(ggp)
-ggdata %>% filter(feature %in% target_genera, is_highlight)  %>% select(contrast, feature, FDR,color) %>% add_sigstart(., "FDR")
-```
-
-```{r}
-target_genera <- ggdata %>% filter(contrast == "FAP vs Control", is_highlight) 
 fap_genera <- target_genera %>% filter(coef < 0) %>% pull(feature)
 control_genera <- target_genera %>% filter(coef > 0) %>% pull(feature)
 target_genera <- target_genera %>% pull(feature)
+
 ggdata_boxplot <- taxa_df %>% select(sample_id, target_genera ) %>% 
                   tidyr::pivot_longer(cols = -sample_id, names_to = "feature", values_to = "ra") %>% 
-                  left_join(mdata_subset, by = "sample_id")  %>% filter(phenotype != "Fatty Liver") %>% 
+                  left_join(mdata_all, by = "sample_id") %>% 
                   mutate(phenotype = factor(phenotype, levels = label_order))
-```
 
+
+```
 
 ```{r}
-genera_order <- ggdata %>% filter(contrast == "FAP vs Control", feature %in% fap_genera, is_highlight) %>% arrange(FDR) %>% pull(feature)
-ggp_fap <- ggplot(ggdata_boxplot %>% filter(feature %in% fap_genera) %>% 
-                        mutate(feature = factor(feature, levels = genera_order)),
-       aes(feature, ra, fill = phenotype_binary, color = phenotype_binary)) + 
-       labs(x= "Phenotype", y = "Relative abundance", fill = "Phenotype", color = "Phenotype" ) + 
-       plot_box_and_jitter(palette, point_size = 1,legend_position = "right") + 
-       theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.4) )
-plot(ggp_fap)
+nrows <- 3
+ann_df <- ggdata %>% filter(is_significant) %>% arrange(desc(color), FDR) %>% 
+          add_sigstars(fdr_p_value = "FDR") %>% 
+          group_by(color) %>%
+          mutate(facet_group = ntile(row_number(), nrows ),
+                facet_group = ifelse(color == "FAP", 0, facet_group), 
+                group1 = "FAP", group2 = "Control",  ) %>% ungroup() %>% 
+          group_by(facet_group) %>% 
+          mutate(xmin = rank(row_number()) - 0.4, xmax = xmin + 0.8) %>% ungroup()
+
+ann_df <- ann_df %>% left_join(ggdata_boxplot %>% group_by(feature) %>% 
+                    summarise(y_val = 0.05 + max(ra)), by ="feature") %>% 
+          mutate(group1 = "FAP", group2 = "Control")
 ```
 
-
-```{r, fig.height=6, fig.width=16}
-genera_order <- ggdata %>% filter(contrast == "FAP vs Control", feature %in% control_genera, is_highlight) %>% arrange(FDR) %>% pull(feature)
-ggp_control <- ggplot(ggdata_boxplot %>% filter(feature %in% control_genera) %>% 
-                        mutate(feature = factor(feature, levels = genera_order),
-                               facet_group = ifelse(as.integer(feature) <= length(genera_order) / 2, "Row 1", "Row 2")), 
-       aes(feature, ra, fill = phenotype_binary, color = phenotype_binary)) + 
-       labs(x= "Phenotype", y = "Relative abundance") + 
-       plot_box_and_jitter(palette, point_size = 0.5) + facet_wrap(~facet_group, scales = "free_x", nrow = 2) +
-       theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.4),
-             strip.text = element_blank())
-plot(ggp_control)
-#ggdata %>% filter(feature %in% target_genera, is_highlight, contrast == "FAP vs Control")  %>% select(contrast, feature, FDR,color) %>% add_sigstart(., "FDR")
-```
-
-## Regularized linear regression
 ```{r}
-results <- get_binary_predictability(taxa_df, mdata, "sample_id", c("phenotype_binary"))
-plot(results$plots$phenotype_binary)
-print(results$results)
+data <- ggdata_boxplot %>%
+        left_join(ann_df %>% select(feature, facet_group), by = "feature") %>% 
+        mutate(feature = factor(feature, levels = ann_df$feature))
+```
+
+```{r, fig.width= 10, fig.height=7}
+ggp <- ggplot(data, aes(feature, ra, color = phenotype_binary, fill = phenotype_binary)) + 
+  geom_boxplot(alpha = 0.3) + 
+  scale_fill_manual(values = palette) + 
+  scale_color_manual(values = palette) + 
+  facet_wrap(~facet_group, scales = "free_y") + 
+  ggpubr::stat_pvalue_manual(ann_df,
+    label = "significance",
+    xmin = "xmin", xmax = "xmax",
+    y.position = "y_val",
+    tip.length = 0,
+    inherit.aes = FALSE, coord.flip = T
+  ) + theme_bw(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.y = element_text(size = 8),
+        strip.background = element_blank(), 
+        strip.text = element_blank()) +   
+  coord_flip() + 
+  labs(x = "Genus", y = "Relative abundance") 
+plot(ggp)
+```
+
+
+
+
+```{r, fig.height=10, fig.width=10}
+volcano_boxplots <- cowplot::plot_grid(plotlist = list(phyla_ra_box + theme(legend.position = "none"), ggp), ncol = 1, align = "v", axis = "l", rel_heights = c(1,3.5))
+volcano_boxplots
+#ggsave(file="figures/f1/figure_1_supp_DE_boxplots.svg", plot=volcano_boxplots, width=10, height=10)
+```
+
+### 2.4.2 Figure 2 contstruction
+
+```{r,fig.width=10, fig.height=10, fig.align='center'}
+empty_plot <- ggplot() + theme_void()
+top_row <- cowplot::plot_grid(phylum_ra, fb_ratio,  rel_widths = c(2.5,1), ncol = 2, label_size = 12)
+
+alpha_div <- cowplot::plot_grid(ggp_list[["shannon"]] ,ggp_list[["simpson"]], ncol =2 )
+divs <- cowplot::plot_grid(empty_plot, alpha_div , beta_div  , ncol = 1,  rel_heights = c(0.3,1, 2))
+bottom_row <- cowplot::plot_grid(divs, volcano,  rel_widths = c(1, 1), label_size = 12)
+
+fig_1 <- cowplot::plot_grid(top_row, bottom_row,  rel_heights = c(1,2), ncol = 1 ) + 
+         theme(axis.title.x = element_text(size = 10), axis.title.y = element_text(size = 10))
+fig_1
+
+# ggsave(file="figures/f1/figure_1.svg", plot=fig_1, width=10, height=10)
+# ggsave(file="figures/f1/f1_phyla_ra.svg", plot=phylum_ra, width=7, height=3.5)
+# ggsave(file="figures/f1/f1_phyla_fb_ratio.svg", plot=fb_ratio, width=3, height=3)
+# ggsave(file="figures/f1/f1_alpha_div_shannon.svg", plot=ggp_list[["shannon"]], width=3, height=3)
+# ggsave(file="figures/f1/f1_alpha_div_simpson.svg", plot=ggp_list[["simpson"]], width=3, height=3)
+# ggsave(file="figures/f1/f1_beta_div.svg", plot=beta_div, width=7, height=7)
+#ggsave(file="figures/f1/f1_volcao_bac.svg", plot=volcano, width=4, height=6)
 ```
 
 

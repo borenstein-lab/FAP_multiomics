@@ -166,10 +166,9 @@ DADA2 processing was performed using the qiime plugin, with the following non-de
 
 The following plot provides an overview of the number of reads discarded at each step.  
 ```{r fig.width=5.5, fig.height=3, fig.align="center"}
-samples.to.exclude <- c()
-pd <- position_dodge(width = 0.4)
+samples.to.exclude <- core_mdata %>% filter(phenotype == "Fatty Liver") %>% pull(sample)
 
-ggplot(dada_stats %>% filter(! `sample-id` %in% samples.to.exclude), 
+ggplot(dada_stats %>% filter(! `sample-id` %in% samples.to.exclude),
        aes(x = Step, y = Count, fill = Step)) +
   geom_boxplot(color = 'black', width = 0.7, outlier.shape = NA) +
   geom_point(aes(group = `sample-id`), alpha = 0.4, position = pd, size = 1) +
@@ -177,10 +176,8 @@ ggplot(dada_stats %>% filter(! `sample-id` %in% samples.to.exclude),
   scale_fill_brewer(palette = 'PuBuGn') +
   ggtitle('Number of reads after each DADA2 processing step') +
   theme_classic() +
-  theme(legend.position = "none") +
+  theme(legend.position = "none") + #scale_y_log10() + 
   theme(plot.title = element_text(hjust = 0.5))
-
-rm(samples.to.exclude)
 ```
 
 Final distribution of read counts per sample:
@@ -214,8 +211,8 @@ __Identified ASV's__
 dada_table <- read_delim("qiime/combined/2_Denoise_EE34_Pooled/table_dada2_exported/feature_table.tsv",
                          delim = "\t", escape_double = FALSE, 
                          trim_ws = TRUE, skip = 1, 
-                         show_col_types = FALSE)
-
+                         show_col_types = FALSE) 
+dada_table <- dada_table %>% select(-intersect(colnames(dada_table),samples.to.exclude))
 n_asvs <- nrow(dada_table)
 # Below formula counts the number of ASV's that appear in less than 10% of samples
 n_asvs_10_perc <- sum(rowSums(dada_table[,-1] > 0) < 0.1*(ncol(dada_table)-1))
@@ -443,7 +440,9 @@ ggplot(tmp, aes(x = relab_unassigned_perc)) +
 Similarly, here we show the percent of reads succesfully assigned to each taxonomic rank. We note that 16S is considered inefficient in identifying bacteria at the species level or below.
 
 ```{r}
-tax_assign <- read_delim("qiime/combined/6_Taxonomy_train_NB/taxonomy_classifications_exported/taxonomy.tsv", 
+taxa_path <- "qiime/combined/6_Taxonomy_train_NB/taxonomy_classifications_exported/taxonomy.tsv"
+taxa_path <- "qiime/combined/6_Taxonomy_GTDB/asv_to_taxonomy_mapping.tsv"
+tax_assign <- read_delim(taxa_path, 
                          delim = "\t", escape_double = FALSE, 
                          trim_ws = TRUE, show_col_types = FALSE)
 names(tax_assign) <- c('asv','full_taxonomy','confidence')

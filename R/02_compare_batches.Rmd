@@ -9,6 +9,7 @@ library(ggplot2)
 library(dplyr)
 source("code/R/utils.R")
 source("code/R/visualization.R")
+source("code/R/statistics.R")
 theme_set(theme_bw(base_size = 15))
 ```
 
@@ -33,7 +34,7 @@ core_mdata <- sample_metadata %>% select(all_of(core_mdata_cols)) %>% #rename(sa
 ### genus distance matrix
 
 ```{r}
-path <- paste0("qiime/combined/6_Taxonomy_GTDB/feature_table.tsv")
+path <- paste0("qiime/combined/6_Taxonomy_GTDB_v11/feature_table.tsv")
 relab<- read.table(path , header = TRUE, sep = "\t")
 genus_norm <- relab %>% filter(stringr::str_detect(taxon , ";g__.+", )) %>%
                tibble::column_to_rownames("taxon") %>%  mutate_all(~ . / sum(.))
@@ -56,7 +57,7 @@ genus_norm <- genus_norm %>% select(non_fatty_liver_samples)
 plot PCoA plots, colored by (a) phenotype and (b) highlighting pairs of samples belonging to the same patient
 ```{r}
 plot_pcoa_2d <- function(dist_df, core_mdata, palette,  x_var = 1, y_var =2,
-                         shape_var = "batch", dist_metric = ""){
+                         shape_var = "batch", dist_metric = "", return_plots = FALSE){
   pcoa_df <- get_pcoa(dist_df, 2)
   eig_vals <- pcoa_df[[1]]
   pcoa_df <- pcoa_df[[2]] %>% left_join(core_mdata, by = "sample_id")
@@ -64,7 +65,7 @@ plot_pcoa_2d <- function(dist_df, core_mdata, palette,  x_var = 1, y_var =2,
   multi_sample_patient = pcoa_df %>% count(patient_id) %>% filter(n>1) %>% pull(patient_id)
   pcoa_df <- pcoa_df %>% mutate(patient_cat = ifelse(patient_id %in% multi_sample_patient, patient_id, "single_sample"))
   # Plot PCs 1 and 2 by phenotype
-  ggp <- ggplot(pcoa_df,aes_string(paste0("axis_", x_var), paste0("axis_", y_var), color = "phenotype", shape = shape_var)) +
+  ggp1 <- ggplot(pcoa_df,aes_string(paste0("axis_", x_var), paste0("axis_", y_var), color = "phenotype", shape = shape_var)) +
       geom_point(size = 2, alpha = 0.7) + 
      ggtitle(paste0('PCoA ',dist_metric,'(Axes ',x_var,' vs. ',y_var,')')) +
       xlab(paste0('Axis ',x_var,' (', eig_vals[x_var], '% variance explained)')) +
@@ -72,11 +73,11 @@ plot_pcoa_2d <- function(dist_df, core_mdata, palette,  x_var = 1, y_var =2,
       theme_classic() +
       theme(plot.title = element_text(hjust = 0.5)) + 
       scale_color_manual(values = palette) 
-  plot(ggp)
+  plot(ggp1)
   
   
   # Plot PCs 1 and 2 by patient and batch
-  ggp <- ggplot(pcoa_df,aes_string(paste0("axis_", x_var), paste0("axis_", y_var), color = "patient_cat", group = "patient_cat", shape = shape_var)) +
+  ggp2 <- ggplot(pcoa_df,aes_string(paste0("axis_", x_var), paste0("axis_", y_var), color = "patient_cat", group = "patient_cat", shape = shape_var)) +
       geom_point(data = pcoa_df %>% filter(patient_cat == "single_sample"), size = 3, alpha = 0.5, color = "grey") +
       geom_point(data = pcoa_df %>% filter(patient_cat != "single_sample"), size = 3, alpha = 0.7) + 
       geom_line(data = pcoa_df %>% filter(patient_cat != "single_sample")) + 
@@ -85,9 +86,12 @@ plot_pcoa_2d <- function(dist_df, core_mdata, palette,  x_var = 1, y_var =2,
       ylab(paste0('Axis ',y_var,' (', eig_vals[y_var], '% variance explained)')) +
       theme_classic() +
       theme(plot.title = element_text(hjust = 0.5))
-  plot(ggp)
-  
+  plot(ggp2)
+  if (return_plots){
+    return(list(pcoa_df, ggp1, ggp2))
+  } else {
   return(pcoa_df)
+  }
 }
 ```
 
@@ -135,35 +139,38 @@ patient_genus_ra_mean_wide <- patient_genus_ra_mean %>% tidyr::spread(genus, mea
 ### Plot the relative abunance Spearman correlation between samples of the same patient in different batches 
 ```{r}
 manual_corr_calc_for_plot <- function(df){
-    person_corr_lab <- df %>% group_by(patient_id) %>% 
-                       summarise(cor_test = list(cor.test(`Batch 22`, `Batch 24`, method = "spearman")),.groups = "drop") %>%
-                        mutate( r = sapply(cor_test, function(x) x$estimate),
-                                r = paste("R =", round(r, 2)),
+    corr_lab <- df %>% group_by(patient_id) %>% 
+                       summarise(cor_test = list(cor.test(`Batch 22`, `Batch 24`, method = "pearson")),.groups = "drop") %>%
+                        mutate( r_raw = sapply(cor_test, function(x) x$estimate),
+                                r = paste("R =", round(r_raw, 2)),
                                 pval = sapply(cor_test, function(x) x$p.value),
                                 fdr = p.adjust(pval, method = "fdr"),
                                 p_string = ifelse( fdr < 2.2e-16, "p < 2.2e-16",
                                                    paste0("p = ",
                                                    formatC(fdr, format = "e", digits = 2))),
                                 label = paste0(r, "\n", p_string)) %>%
-                      select(patient_id, label) %>% unique()
-    return (person_corr_lab)
+                      select(patient_id, label, r_raw, fdr) %>% unique()
+    return (corr_lab)
 }
 ```
 
 
-```{r, fig.width=12, fig.height=10}
+```{r, fig.width=12, fig.height=6}
 ggdata <- patient_genus %>% select(-sample_id) %>%  tidyr::pivot_wider(names_from = batch, values_from = ra) 
-person_corr_lab <- manual_corr_calc_for_plot(ggdata)
+corr_lab <- manual_corr_calc_for_plot(ggdata)
+
+print( corr_lab %>% summarise(mean(r_raw)))
 
 ggp <- ggplot(ggdata, aes(x = `Batch 22`, y = `Batch 24`)) + geom_point() + 
        geom_abline(intercept = 0, slope = 1) + 
        scale_x_log10() + scale_y_log10() +
-       facet_wrap(~patient_id, scales = "free") + 
-        geom_text(data = person_corr_lab, 
+       facet_wrap(~patient_id, scales = "free", nrow = 3) + 
+        geom_text(data = corr_lab, 
             aes(x = 0.004, y = 0.00001, label = label),
             hjust = 0, vjust = 0, size = 3, inherit.aes = FALSE) +
        theme_bw(base_size = 12)
 plot(ggp)
+#ggsave("figures/S2_genus_corr.svg", ggp, width = 12, height = 6)
 ```
 ### Create relative abundance and metadata dataframes with the mean samples
 ```{r}
@@ -180,9 +187,14 @@ core_mdata_with_mean <- rbind(core_mdata, core_mdata_mean_samples)
 
 ### Visualize the new PCoA plot with the mean samples
 PCoA is a distance takes in accont the distances between all samples, so the mean samples should fall around (but not nessecarily exactly in) the middle of the samples of the same patient.
-```{r}
+```{r, fig.width=6, fig.height=4}
 genus_dist <- vegan::vegdist(genus_ra_with_mean %>% t(), method = "bray") %>% as.matrix()
-pcoa_df <- plot_pcoa_2d(genus_dist,core_mdata_with_mean, palette)
+result <- plot_pcoa_2d(genus_dist,core_mdata_with_mean, palette, return_plots = T)
+pcoa_df <- result[[1]]
+
+result[[3]] 
+#ggsave("figures/s2_pcoa_phenotype.svg", result[[2]],width = 6, height = 4)
+#ggsave("figures/s2_pcoa_subject.svg", result[[3]] +  guides(color = guide_legend(ncol = 2, byrow = TRUE)),width = 7, height = 4)
 ```
 
 ### Plot PCoA with only one sample per patient (single samples and mean samples)
@@ -202,7 +214,6 @@ genus_ra_only_mean_filt <- remove_rare_features(t(genus_ra_only_mean),
                                                 rescale = T) %>% t() %>% as.data.frame()
 ggdata <- genus_ra_only_mean_filt  %>% t() %>% vegan::vegdist(method = "bray") %>% as.matrix()
 pcoa_df <- plot_pcoa_2d(ggdata, core_mdata_with_mean, palette)
-pcoa_df <- plot_pcoa_2d(ggdata, core_mdata_with_mean, palette, shape_var = "is_surgery")
 ```
 
 ```{r, fig.width=12, fig.height=10}
@@ -211,6 +222,7 @@ ggdata <- patient_genus %>% select(-sample_id) %>% filter(genus %in% rownames(ge
           tidyr::pivot_wider(names_from = batch, values_from = ra)
 
 person_corr_lab <- manual_corr_calc_for_plot(ggdata)
+print( person_corr_lab %>% summarise(mean(r_raw)))
 
 ggp <- ggplot(ggdata, aes(x = `Batch 22`, y = `Batch 24`)) + geom_point() + 
        geom_abline(intercept = 0, slope = 1) + 
@@ -254,13 +266,14 @@ genus_ra_pre_batch_fix_filt <- genus_ra_pre_batch_fix %>% select(all_of(colnames
 ```{r}
 # write.csv(core_mdata_with_mean, "metadata/clean/core_metadata_with_mean.csv", row.names = FALSE)
 # 
-# write.csv(genus_ra_pre_batch_fix, "processed_data/genus_ra_pre_batch_merge.csv", row.names = FALSE)
-# write.csv(genus_ra_pre_batch_fix_filt, "processed_data/genus_ra_pre_batch_merge_non_rare.csv", row.names = FALSE)
-# 
-# write.csv(genus_ra_only_mean, "processed_data/genus_ra_all.csv", row.names = FALSE)
-# write.csv(genus_ra_only_mean_filt, "processed_data/genus_ra_non_rare.csv", row.names = FALSE)
+#  write.csv(genus_ra_pre_batch_fix, "processed_data/genus_ra_pre_batch_merge_v11.csv", row.names = FALSE)
+#  write.csv(genus_ra_pre_batch_fix_filt, "processed_data/genus_ra_pre_batch_merge_non_rare_v11.csv", row.names = FALSE)
+# # 
+#  write.csv(genus_ra_only_mean, "processed_data/genus_ra_all_v11.csv", row.names = FALSE)
+#  write.csv(genus_ra_only_mean_filt, "processed_data/genus_ra_non_rare_v11.csv", row.names = FALSE)
 ```
 
+## TO BE DELETED
 # Functional results
 
 ```{r}

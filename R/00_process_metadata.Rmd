@@ -1,13 +1,18 @@
 ---
-title: "R Notebook"
-output:
-  html_document:
-    df_print: paged
+title: "Meta data processing"
+output: html_notebook
 ---
 
 ```{r}
 library(dplyr)
-getwd()
+library(ggplot2)
+source("code/R/visualization.R")
+source("code/R/statistics.R")
+```
+
+```{r}
+palette_df <- read.csv("metadata/clean/project_palette.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+palette <- setNames(palette_df$color, palette_df$label)
 ```
 
 ```{r}
@@ -15,6 +20,7 @@ mdata_prospective_path = "metadata/clean/metadata_prospective.csv"
 mdata_prospective = read.csv(mdata_prospective_path, header = TRUE, sep = ",", stringsAsFactors = FALSE)
 colnames(mdata_prospective) = mdata_prospective %>% colnames() %>% tolower() %>% gsub("_[0-9].*|_laura","",.)
 mdata_prospective <- mdata_prospective %>% mutate(surgery_type = "No surgery", 
+                                                  n_polyps = NA,
                                                   phenotype = ifelse(is_fatty_liver, "Fatty Liver", "Control"),
                                                   cohort = "Prospective Cohort")
 ```
@@ -34,7 +40,7 @@ mdata_fap <- mdata_fap %>% mutate(colonoscopy_classification = 5,
 ```{r}
 colono_groups_path <- "metadata/clean/sample_summary.csv"
 colono_groups <- read.csv(colono_groups_path, header = TRUE,
-                          sep = ",", stringsAsFactors = FALSE) %>% select(-n)
+                          sep = ",", stringsAsFactors = FALSE)# %>% select(-n)
 ```
 
 ```{r}
@@ -56,16 +62,15 @@ mdata <- mdata %>% select(patient_id, case_number, sigma_id) %>%
 mdata <- mdata %>% filter(!sample_id %in% c(0, "35808028", NA)) # sample_id 0 is for samples without a case number, 35808028 is a duplicate case number for two patients (prospective cohort)
 ```
 
+```{r}
+#write.csv(mdata, "metadata/clean/metadata_combined.csv", row.names = F)
+```
+
 # Add specific columns from the FAP metadata
 ```{r}
 cols_to_add <- c("number_of_polyps_colonoindex_date")
 mdata_to_add <- mdata_fap %>% mutate(patient_id = paste0(track_number, "_FAP Cohort")) %>% select(patient_id, all_of(cols_to_add))
-mdata <- mdata %>% left_join(mdata_to_add, by = "patient_id")
-```
-
-
-```{r}
-write.csv(mdata, "metadata/clean/metadata_combined.csv", row.names = FALSE)
+mdata <- mdata %>% left_join(mdata_to_add, by = "patient_id") %>% rename(n_polyps = number_of_polyps_colonoindex_date)
 ```
 
 ## Compare key metadata features between groups
@@ -78,19 +83,26 @@ batch_24_specific <- c("35919746","35956773" ) # patients 4 and 7
 ```{r}
 df <- mdata %>% filter(sample_id %in% c(target_samples,batch_24_specific)) %>%
       select(patient_id, age, gender, phenotype, surgery_type, 
-             bmi,is_current_smoker, is_ever_smoker, n_polyps) %>% unique() %>% 
+             bmi,is_current_smoker, is_ever_smoker, n_polyps, med_diet_sum) %>% unique() %>% 
                  filter(phenotype != "Fatty Liver") %>% 
                  mutate(phenotype = factor(phenotype, levels = c("Classical FAP","Non-classical FAP","Control")),
                         smoking = case_when(is_ever_smoker == 0 ~ "Non-smoker",
                                             is_current_smoker == 0 ~ "Former smoker",
                                            TRUE ~ "Current smoker"), 
-                         is_ever_smoker = ifelse( is_ever_smoker == 0, "Non-smoker","Smoker"))
+                         is_ever_smoker = ifelse( is_ever_smoker == 0, "Non-smoker","Smoker"),
+                        is_surgery = ifelse(surgery_type == "No surgery", "No surgery", "Surgery"))
 df %>% sample_n(10)
 ```
 
 ```{r}
-p_age <- ggplot(df, aes(phenotype, age, fill = phenotype, color = phenotype)) + plot_box_and_jitter(palette = palette) + labs(y = "Age", x ="")
-p_bmi <- ggplot(df, aes(phenotype, bmi, fill = phenotype, color = phenotype)) + plot_box_and_jitter(palette = palette) + labs(y = "BMI", x = "")
+max_age <- max(df$age) # used to increase the y limit and leave space for significance start
+min_age <- min(df$age)
+max_bmi <- max(df$bmi) # used to increase the y limit and leave space for significance start
+min_bmi <- min(df$age)
+p_age <- ggplot(df, aes(phenotype, age, fill = phenotype, color = phenotype)) + plot_box_and_jitter(palette = palette) + labs(y = "Age", x ="") + 
+  ylim(min_age*0.95, max_age*1.1)
+p_bmi <- ggplot(df, aes(phenotype, bmi, fill = phenotype, color = phenotype)) + plot_box_and_jitter(palette = palette) + labs(y = "BMI", x = "") + 
+  ylim(min_bmi*0.95, max_bmi*1.1)
 ```
 
 ```{r}
@@ -126,21 +138,26 @@ p_polyps <- ggplot(ggdata, aes(x = phenotype, y = n_polyps, fill = phenotype, co
 ```
 
 ```{r}
-ggdata <- df %>% filter(phenotype != "Control") %>% count(phenotype, surgery_type) %>% group_by(phenotype) %>% mutate(perc = n/sum(n)) %>%
-          mutate(surgery_type = factor(surgery_type, levels = rev(c("No surgery", "Subtotal colectomy", "Pouch"))))
+ggdata <- df %>% filter(phenotype != "Control") %>% count(phenotype, is_surgery) %>% group_by(phenotype) %>% mutate(perc = n/sum(n)) #%>%
+          # mutate(surgery_type = factor(surgery_type,
+          #                              levels = rev(c("No surgery", "Subtotal colectomy", "Pouch"))))
 
-p_surgery <- ggplot(ggdata, aes(x = phenotype, y = perc, fill = surgery_type, label = n)) +  
+p_surgery <- ggplot(ggdata, aes(x = phenotype, y = perc, fill = is_surgery, label = n)) +  
   geom_bar(position="fill", stat="identity",colour="black",) +
   geom_text(position = position_fill(vjust = 0.5), size = 3, color = "black") +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  scale_fill_manual(values = rev(c( "#f2f2f2","#cccccc", "#7f7f7f"))) + 
+  #scale_fill_manual(values = rev(c( "#f2f2f2","#cccccc", "#7f7f7f"))) + 
+  scale_fill_manual(values = rev(c( "#f2f2f2", "#7f7f7f"))) + 
   labs(y = "Proportion", fill = "Surgery", x = "") +
   theme_bw(base_size = 12) + theme(legend.position = "top")
 ```
 
 ```{r fig.height=10, fig.width=10}
-(p_age + p_bmi)/(p_smoking + p_gender)/(p_polyps + p_surgery) +patchwork::plot_annotation(tag_levels = 'A')
-
+library(patchwork)
+s1 = (p_age + p_bmi)/(p_polyps + p_gender)/(p_smoking + p_surgery) + 
+      patchwork::plot_annotation(tag_levels = 'A')
+plot(s1)
+ggsave("figures/S1_metadata.svg", s1, width = 21, height = 21.3, units = "cm")
 ```
 
 ```{r}
@@ -153,13 +170,24 @@ wilcox_tests %>% add_significance()
 chi_sq_tests <- c((df %>% select(phenotype, is_current_smoker) %>% table() %>% chisq.test())$p.value,
                   (df %>% select(phenotype, gender) %>% table() %>% chisq.test())$p.value,
                   (df %>% filter(phenotype != "Control") %>% mutate(phenotype = as.character(phenotype)) %>% 
-          select(phenotype, surgery_type)  %>% table() %>% chisq.test())$p.value) %>% as.numeric()
+          select(phenotype, is_surgery)  %>% table() %>% chisq.test())$p.value) %>% as.numeric()
 chi_sq_tests <- data.frame(p_value = chi_sq_tests, category = c("smoking", "gender", "surgery")) %>% mutate(group1 = "multi group comparison", group2 = NA)
 ```
 
 
 ```{r}
-statistics_results <- rbind(wilcox_tests, A)  %>% add_significance()
+statistics_results <- rbind(wilcox_tests, chi_sq_tests)  %>% add_significance()
 statistics_results
 ```
+
+## diet
+```{r, fig.width=5, fig.height=5}
+wilcox_test_by_pair(df, "phenotype", "med_diet_sum ~ phenotype")
+
+ggp <- ggplot(df, aes(phenotype, med_diet_sum, color = phenotype, fill = phenotype)) + 
+       plot_box_and_jitter(palette = palette) + 
+       labs(x = "", y = "Mediterranean diet score")
+#ggsave("figures/f2/med_diet_all.svg", ggp, height = 4, width = 4)
+```
+
 

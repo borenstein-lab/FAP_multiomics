@@ -15,9 +15,10 @@ plot_box_and_jitter <- function(palette = NULL,font_size = 12, legend_position =
 }
 
 ### Relative abundance functions
-plot_abundance_barplot <- function(ggdata, palette, x_var = "patient_id", y_var = "ra", fill_var = "taxon" ){
+plot_abundance_barplot <- function(ggdata, palette, x_var = "patient_id", y_var = "ra", fill_var = "taxon",
+                                   width =0.9 ){
   ggp <- ggplot(ggdata, aes_string(x = x_var, y = y_var, fill = fill_var)) + 
-    geom_bar(stat = "identity") + 
+    geom_bar(stat = "identity", width = width) + 
     scale_fill_manual(values = palette) +
     labs(x = "Sample", y = "Relative abundance") +
     theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
@@ -119,9 +120,9 @@ plot_pcoa_2d <- function(dist_df, core_mdata, palette,  x_var = 1, y_var =2,
 ## MaAslin2 functions
 plot_volcano <- function(df, x_var = "coef", y_var = "-log10(FDR)",
                          color_var = "color", label_var = "label",
-                         fdr_min = 0.1, coef_min = 1,n_label_overlaps = 5 ){
+                         fdr_min = 0.1, coef_min = 1,n_label_overlaps = 5, label_size = 10, point_size = 2){
   ggp <- ggplot(df, aes_string(x = x_var, y = y_var,  color = color_var)) +
-    geom_point(size = 2) +
+    geom_point(size = point_size, alpha = 0.7) +
     labs(x = "Effect size [log2(FC)]", y = "-log10(FDR)") + 
     guides(alpha = "none",   color = guide_legend(
       title = "Enrichment group",
@@ -130,8 +131,8 @@ plot_volcano <- function(df, x_var = "coef", y_var = "-log10(FDR)",
     geom_vline(xintercept = coef_min, linetype = "dashed", color = "black") + 
     geom_vline(xintercept = -coef_min, linetype = "dashed", color = "black") + 
     ggrepel::geom_text_repel(aes_string(label = label_var),
-                             force = 10, max.overlaps = n_label_overlaps,
-                             min.segment.length = 0) +
+                             force = 20, max.overlaps = n_label_overlaps,
+                             min.segment.length = 0, size = label_size) +
     theme_bw(base_size = 12)# + theme(legend.position = "top")
   return(ggp)
 }
@@ -143,7 +144,7 @@ prepare_maaslin2_for_volcano <- function(df,metadata_vars,  fdr_min = 0.1, coef_
            is_coef = abs(coef) > coef_min,
            is_highlight = is_significant & is_coef,
            label = ifelse(is_highlight, feature, ""),
-           color = ifelse(is_highlight & coef > coef_min, pair_a, pair_b),
+           color = ifelse(is_highlight & coef < coef_min, pair_a, pair_b),
            color = ifelse(!is_highlight,"Non-Significant", color))
   return(ggdata)
 }
