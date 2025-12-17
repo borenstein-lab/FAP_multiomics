@@ -4,6 +4,8 @@ library(pROC)
 library(dplyr)
 library(permuco)
 library(emmeans)
+library(tibble)
+library(vegan)
 
 perm_ancova_pairs <- function(df, X, group, covariates, np = 2000,
                               emmeans_adjust = "tukey",  # multiplicity control for parametric pairwise p
@@ -141,26 +143,6 @@ remove_factors <- function(df){
   return(df)
 }
 
-create_dummy_vars <- function(df, target_vars){
-  # Step 1: Remove factors and find character features
-  df <- remove_factors(df)
-  char_cols <- sapply(df %>% select(all_of(target_vars)), function(x) is.character(x))
-  nonchar_df <- df[!char_cols]
-  cat_df <- lapply(df[char_cols], as.factor) %>% as.data.frame()
-  
-  # Step 2: Create dummy variables (drop intercept so all dummies are separate)
-  char_dummies <- model.matrix(~ . - 1, data = cat_df)
-  drop_dummies <- lapply(cat_df, function(f) levels(f)[1])
-  
-  # Step 3: Remove the first level of each factor (the intercept)
-  drop_names <- unlist(mapply(function(name, val) paste0(name, val), names(drop_dummies), drop_dummies))
-  char_dummies <- char_dummies[, !colnames(char_dummies) %in% drop_names, drop = FALSE]
-  
-  # Step 4: Combine back with non-categorical columns
-  df_binary <- cbind(nonchar_df, char_dummies)
-  colnames(df_binary) <- make.names(colnames(df_binary))
-  return(df_binary)
-}
 
 get_residuals <- function(df, regressors){
   residuals_df <- df
@@ -362,4 +344,134 @@ run_ora_on_pathway_list <- function(target, pathway_list, universe){
   })
   ora_results_df <- do.call(rbind, ora_results)
   return(ora_results_df)
+}
+
+## Permanova
+get_permanova <- function(disct_metadata, 
+                          dist_matrix, 
+                          dist_metric_name,
+                          sample_id_column = 'sample_id', 
+                          metadata_cols_to_analyze = NULL, 
+                          metadata_cols_fix_effects = NULL,
+                          fdr_threshold = 0.1,
+                          permutations = 9999,
+                          plot_labels = NULL,
+                          pcoa_fill = NULL,
+                          ord = NULL,
+                          add_centroid = TRUE,
+                          seed = 111,
+                          level = 0.9,
+                          pairs_mode = FALSE
+){
+  
+  # Required libraries loading
+  set.seed(seed)
+  
+  # Define metadata_cols_to_analyze as all columns if not provided, and check if exist if provided.
+  if (!is.null(metadata_cols_to_analyze)) {
+    if (!all(metadata_cols_to_analyze %in% colnames(disct_metadata)))
+      stop("One of metadata_cols_to_analyze not found in metadata")
+  } else {
+    metadata_cols_to_analyze <- colnames(disct_metadata) 
+    metadata_cols_to_analyze <- metadata_cols_to_analyze[!metadata_cols_to_analyze %in% c(sample_id_column)]
+    warning("metadata_cols_to_analyze not provided, all metadata columns will be taken except sample_id_column.\n")
+  }
+  
+  # More data verifications
+  if (!sample_id_column %in% colnames(dist_matrix))
+    stop("sample_id_column not found in dist_matrix")
+  if (!sample_id_column %in% colnames(disct_metadata))
+    stop("sample_id_column not found in metadata")
+  if (!all(metadata_cols_to_analyze %in% colnames(disct_metadata)))
+    stop("One of metadata_cols_to_analyze not found in metadata")
+  if (nrow(disct_metadata) != nrow(dist_matrix))
+    warning("# of samples is different between the distance matrix and the metadata. Only samples with both features and metadata will be used for the following analysis.\n")
+  
+  # Make sure all random/fixed effects are indeed in data
+  if (!is.null(metadata_cols_fix_effects)) {
+    if (!all(metadata_cols_fix_effects %in% colnames(disct_metadata)))
+      stop("One of metadata_cols_fix_effects not found in metadata")
+  }
+  
+  # Merge the dataframes
+  df <- merge(x = dist_matrix, y = disct_metadata, by = sample_id_column, all.x=FALSE)  %>%
+    remove_rownames %>% 
+    column_to_rownames(var=sample_id_column)
+  
+  if (nrow(df) == 0) stop('No common samples found.')
+  
+  # Add fixed effects to a string that later will be added to the formula and check that they are not one of the metadata_cols_to_analyze.
+  mixed_string = ""
+  if (!is.null(metadata_cols_fix_effects)) {
+    for (fixed_col in metadata_cols_fix_effects) {
+      # Validate that all metadata_cols_fix_effects not in metadata_cols_to_analyze.
+      if (fixed_col %in% metadata_cols_to_analyze)
+        stop(paste0("Shared column between metadata_cols_fix_effects and metadata_cols_to_analyze: ", 
+                    fixed_col, "\nTry again with different metadata_cols_fix_effects!\n"))
+      
+      # Remove rows with missing fixed effect values
+      df <- df %>% filter(!is.na(get({{fixed_col}})))
+      mixed_string =  paste0(mixed_string, " + tmp_df[,'", fixed_col, "'] ")
+    }
+  }
+
+  # Run adonis2
+  pvals <- c()
+  for (col in metadata_cols_to_analyze) {
+    message('Working on variable: ', col)
+    tmp_df <- df[!is.na(df[,col]), ]
+    
+    # Check that `col` is not a constant
+    if (n_distinct(tmp_df[[col]]) == 1) stop(paste('Column', col, 'has only one value, cannot run PERMANOVA'))
+    
+    formula_string <- paste("tmp_df[, rownames(tmp_df)] ~ tmp_df[[col]]", mixed_string)
+    permanova <- adonis2(as.formula(formula_string),
+                         permutations = permutations)
+    pvals[[col]] <- permanova$`Pr(>F)`[1]
+  }
+  
+  # Define pcoa_values varible as NULL, in order to return it when there is no significant results.
+  pcoa_values <- NULL
+  
+  # Call plot_colored_pcoa_discrete for significant features.
+  all_fdrs <- p.adjust(pvals, 'fdr')
+  plots <- list()
+  if(!all(all_fdrs > fdr_threshold)) {
+    for (metadata_feature in names(all_fdrs[all_fdrs <= fdr_threshold])){
+      
+      # Generate PCoA plots of all the data
+      if (!pairs_mode){
+        p12 <- plot_colored_pcoa_discrete(dist_matrix, disct_metadata, sample_id_column, metadata_feature, dist_metric_name, 1, 2, plot_labels, pcoa_fill, ord, add_centroid, level)
+        plots[[paste0(metadata_feature,"_pc1&pc2")]] <- p12$p
+        pcoa_values <- p12$pcoa_values
+        p13 <- plot_colored_pcoa_discrete(dist_matrix, disct_metadata, sample_id_column, metadata_feature, dist_metric_name, 1, 3, plot_labels, pcoa_fill, ord, add_centroid, level)$p
+        plots[[paste0(metadata_feature,"_pc1&pc3")]] <- p13
+        p23 <- plot_colored_pcoa_discrete(dist_matrix, disct_metadata, sample_id_column, metadata_feature, dist_metric_name, 2, 3, plot_labels, pcoa_fill, ord, add_centroid, level)$p
+        plots[[paste0(metadata_feature,"_pc2&pc3")]] <- p23
+        
+        # Generate PCoA plots for all pairs of comparisons (although the permanova is for all the data),
+      } else {
+        disct_metadata[, "metadata_feature"] <- disct_metadata[, metadata_feature]
+        pairs <- combn(unique(disct_metadata$metadata_feature), 2)
+        for (i in 1:ncol(pairs)) {
+          pair <- pairs[, i]
+          p12 <- plot_colored_pcoa_discrete(dist_matrix, disct_metadata, sample_id_column, metadata_feature, dist_metric_name, 1, 2, plot_labels, pcoa_fill, ord, add_centroid, level, pair)
+          plots[[paste0(metadata_feature, "_pc1&pc2_", pair[1], "_", pair[2])]] <- p12$p
+          pcoa_values <- p12$pcoa_values
+          p13 <- plot_colored_pcoa_discrete(dist_matrix, disct_metadata, sample_id_column, metadata_feature, dist_metric_name, 1, 3, plot_labels, pcoa_fill, ord, add_centroid, level, pair)$p
+          plots[[paste0(metadata_feature, "_pc1&pc3_", pair[1], "_", pair[2])]] <- p13
+          p23 <- plot_colored_pcoa_discrete(dist_matrix, disct_metadata, sample_id_column, metadata_feature, dist_metric_name, 2, 3, plot_labels, pcoa_fill, ord, add_centroid, level, pair)$p
+          plots[[paste0(metadata_feature, "_pc2&pc3_", pair[1], "_", pair[2])]] <- p23
+          
+        }
+      }
+    }
+  }
+  
+  # Return a list of a data frame of the p-values and the FDRs, and the PCoA plots.
+  results = data.frame(unlist(pvals), unlist(all_fdrs)) %>%
+    rename(pvals = 1, FDR = 2) %>%
+    tibble::rownames_to_column("feature")
+  
+  return(list(results = results, plots = plots, pcoa_values = pcoa_values))
 }

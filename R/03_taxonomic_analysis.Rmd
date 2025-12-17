@@ -76,7 +76,7 @@ ggdata <- relab_phy %>% rownames_to_column("sample_id") %>%
           mutate(taxon = ifelse(taxon %in% non_rare_phyla, taxon, "Other")) %>%
           group_by(sample_id, taxon) %>% summarise(ra = sum(ra)) %>% ungroup() %>%
           inner_join(mdata_all,by = "sample_id") %>% 
-          group_by(patient_id ,phenotype, phenotype_binary, taxon )  %>% summarise(ra = mean(ra)) %>% ungroup()
+          group_by(patient_id ,phenotype, phenotype_binary, taxon )  %>% summarise(ra = mean(ra)) %>% ungroup() %>% mutate(phenotype = factor(phenotype, levels = label_order))
 
 tmp_palette <- colorRampPalette(RColorBrewer::brewer.pal(9,name = 'RdYlGn'))(length(non_rare_phyla))
 names(tmp_palette) <- non_rare_phyla
@@ -86,7 +86,7 @@ ggdata <- ggdata %>% mutate(taxon = factor(taxon, levels = c(non_rare_phyla, "Ot
 ```
 ```{r}
 phylum_ra <- plot_abundance_barplot(ggdata, tmp_palette) + 
-  facet_grid(~phenotype_binary, scales = "free_x", space = "free") + labs(fill = "Phylum") + 
+  facet_grid(~phenotype, scales = "free_x", space = "free") + labs(fill = "Phylum") + 
         theme_classic(base_size = 10)  +
         theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
               strip.background =element_rect(fill="grey95"),
@@ -333,8 +333,8 @@ fig_1 <- cowplot::plot_grid(top_row, bottom_row,  rel_heights = c(1,2), ncol = 1
          theme(axis.title.x = element_text(size = 10), axis.title.y = element_text(size = 10))
 fig_1
 
-# ggsave(file="figures/f1/figure_1.svg", plot=fig_1, width=10, height=10)
-# ggsave(file="figures/f1/f1_phyla_ra.svg", plot=phylum_ra, width=7, height=3.5)
+ #ggsave(file="figures/f1/figure_1.svg", plot=fig_1, width=10, height=10)
+ #ggsave(file="figures/f1/f1_phyla_ra.svg", plot=phylum_ra, width=7, height=3.5)
 # ggsave(file="figures/f1/f1_phyla_fb_ratio.svg", plot=fb_ratio, width=3, height=3)
 # ggsave(file="figures/f1/f1_alpha_div_shannon.svg", plot=ggp_list[["shannon"]], width=3, height=3)
 # ggsave(file="figures/f1/f1_alpha_div_simpson.svg", plot=ggp_list[["simpson"]], width=3, height=3)
