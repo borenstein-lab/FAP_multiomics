@@ -13,7 +13,6 @@ The analysis is organized into a sequential series of R Markdown notebooks and h
 
 | Directory/File | Description |
 | :--- | :--- |
-| **``** | Contains all analysis notebooks and helper functions. |
 | `python/metabolomics_data_preprocessing.ipynb` | **Pre-processing:** Preprocessing and ID mapping of raw metabolomics data. |
 | `R/00_process_metadata.Rmd` | **Cohort Definition:** Cleaning clinical metadata and defining study groups (FAP vs. Control). |
 | `R/01_QC.Rmd` | **Microbiome QC:** Rarefaction curves, prevalence filtering, and sequencing depth evaluation. |
