@@ -475,3 +475,275 @@ get_permanova <- function(disct_metadata,
   
   return(list(results = results, plots = plots, pcoa_values = pcoa_values))
 }
+
+
+get_differential_abundance <- function(feat_table, 
+                                       disct_metadata, 
+                                       sample_id_column = 'sample_id', 
+                                       metadata_cols_to_analyze = NULL,
+                                       metadata_cols_fix_effects = NULL,
+                                       metadata_cols_rand_effects = NULL,
+                                       fdr_threshold = 0.1,
+                                       output_dir = "MaAsLin2_output",
+                                       return_maaslin_plots = FALSE,
+                                       keep_maaslin_plots = FALSE,
+                                       normalization_method = "NONE",
+                                       transformation_method = "LOG",
+                                       analysis_method = "LM",
+                                       category_name_map = NULL,
+                                       skip_fdr_correction = FALSE,
+                                       logscale_y_for_plot = FALSE,
+                                       quiet = FALSE,
+                                       ord=NULL) {
+  # Required libraries loading
+  require(Maaslin2)
+  require(ggplot2)
+  require(ggsignif)
+  require(grid)
+  require(png)
+  require(dplyr)
+  require(ggpubr)
+  require(purrr)
+  
+  # Data verifications
+  # In case maaslin plots required, change keep_maaslin_plots to TRUE.
+  if (return_maaslin_plots & !(keep_maaslin_plots)){
+    message("Can not return maaslin plots if keep_maaslin_plots = FALSE. keep_maaslin_plots was changed to TRUE.\n")
+    keep_maaslin_plots = TRUE
+  }
+  
+  # If no metadata_cols_to_analyze provided, run the MaAsLin2 on all the metadata columns.
+  if (is.null(metadata_cols_to_analyze))
+    metadata_cols_to_analyze = colnames(disct_metadata)
+  
+  # Check if metadata columns are discrete (1, 0 and NA).
+  for (col in metadata_cols_to_analyze){ 
+    if (length(unique(disct_metadata[,col])) > 3)
+      warning(paste0("Too many values in disct_metadata in the ", col, " column"))
+  }
+  
+  # Check if normalization method fits the data (if only one column: normalization method cannot be 'TSS')
+  if ((ncol(feat_table) ==  2) & (normalization_method == "TSS")){
+    stop("TSS normlaization is not allowed in case there is only one feature in feat_table. 
+         Try again with normalization_method = 'NONE'.")
+  }
+  
+  # Create output directory (will be deleted if not required).
+  if (!dir.exists(output_dir))
+    dir.create(output_dir)
+  
+  # Convert sample_id column to rownames for MaAsLin2 run.
+  disct_metadata <- disct_metadata %>% remove_rownames %>% column_to_rownames(var=sample_id_column)
+  feat_table <- feat_table %>% remove_rownames %>% column_to_rownames(var=sample_id_column)
+  
+  # Remove samples not in both tables, and order samples identically
+  samples_to_include <- intersect(row.names(disct_metadata), row.names(feat_table))
+  disct_metadata <- disct_metadata[samples_to_include,]
+  feat_table <- feat_table[samples_to_include,,drop=FALSE]
+  
+  # TODO: warn if some samples were not in both tables
+  
+  # Check that all the metadata_cols_rand_effects are not in metadata_cols_to_analyze.
+  for (rand_col in metadata_cols_rand_effects){
+    if (rand_col %in% metadata_cols_to_analyze)
+      stop(paste0("Shared column between metadata_cols_rand_effects and metadata_cols_to_analyze: ", 
+                  rand_col, "\nTry again with different metadata_cols_rand_effects!\n"))
+  }
+  
+  # Go over fixed effects and perform one-hot encoding if needed
+  fixed_cols_final_names <- c()
+  for (fixed_col in metadata_cols_fix_effects) {
+    
+    # Validate that metadata_cols_fix_effects are not in metadata_cols_to_analyze.
+    if (fixed_col %in% metadata_cols_to_analyze)
+      stop(paste0("Shared column between metadata_cols_fix_effects and metadata_cols_to_analyze: ", 
+                  fixed_col, "\nTry again with different metadata_cols_fix_effects!\n"))
+    
+    # Check if fixed column is numeric with less than 5 unique values or categorical. Perform one-hot encoding in these cases.
+    if (((is.numeric(disct_metadata[, fixed_col])) & 
+         (n_distinct(disct_metadata[, fixed_col]) < 5)) | 
+        (!is.numeric(disct_metadata[, fixed_col]))) {
+      
+      # Print a message if there are more than 5 categories in the metadata_cols_fix_effects because it might affect the FDR correction.
+      if (n_distinct(disct_metadata[[fixed_col]]) > 5)
+        message("Too many unique values in ", fixed_col, " column. It might affect the FDR correction and omit some significant results!")
+      
+      # Perform one-hot encoding for columns if they have more then 2 categories.
+      if (n_distinct(disct_metadata[[fixed_col]]) > 2){
+        message("Performing one-hot encoding on ", fixed_col)
+        fixed_cols_final_names <- c(fixed_cols_final_names, paste(fixed_col, unique(disct_metadata[[fixed_col]]), sep = '_'))
+        tmp_metadata_rownames <- rownames(disct_metadata)
+        disct_metadata <- disct_metadata %>% mutate(value = 1)  %>% spread(fixed_col, value,  fill = 0, sep = '_')
+        rownames(disct_metadata) <- tmp_metadata_rownames
+        
+      } else { # Categorical with 2 values or less. One-hot is not needed 
+        fixed_cols_final_names <- c(fixed_cols_final_names, fixed_col)
+      }
+      
+    } else { # Numeric case, one-hot is not needed  
+      fixed_cols_final_names <- c(fixed_cols_final_names, fixed_col)
+    }
+  }
+  
+  # Rum MaAsLin2
+  maaslin2_signif_results <- data.frame() # Initialize
+  maaslin2_all_results <- data.frame() # Initialize
+  
+  for (col in metadata_cols_to_analyze) {
+    if (!quiet) message('Working on column: ', col)
+    
+    # For multi-category variables, we run differential abundance separately for each pair of categories
+    for (pair in combn(na.omit(unique(disct_metadata[[col]])), 2, simplify = FALSE)) {
+      
+      # Keep only the two selected values (also drop missing values)
+      tmp_metadata <- disct_metadata[(!is.na(disct_metadata[[col]])) & (disct_metadata[[col]] %in% pair), ]
+      
+      # Get the final list of samples for which DA will be calculated
+      samples_to_include <- intersect(row.names(tmp_metadata), row.names(feat_table))
+      tmp_metadata <- tmp_metadata[samples_to_include,,drop=F]
+      tmp_feat_table <- feat_table[samples_to_include,,drop=F]
+      
+      # Remove constant columns if exist
+      tmp_metadata <- tmp_metadata[, apply(tmp_metadata, 2, n_distinct) > 1]
+      
+      # Fix column names if needed
+      colnames(tmp_metadata) <- make.names(colnames(tmp_metadata))
+      if (!is.null(metadata_cols_rand_effects))
+        metadata_cols_rand_effects <- make.names(metadata_cols_rand_effects)
+      
+      invisible(capture.output(tmp_results <- Maaslin2(
+        input_data = tmp_feat_table, 
+        input_metadata = tmp_metadata, 
+        output = paste(output_dir, "/", col, sep=""),
+        fixed_effects = make.names(c(col, fixed_cols_final_names)),
+        random_effects = metadata_cols_rand_effects,
+        normalization = normalization_method,
+        transform = transformation_method,
+        analysis_method = analysis_method,
+        plot_scatter = keep_maaslin_plots,
+        max_significance = fdr_threshold,
+        plot_heatmap = FALSE
+      )))
+      
+      tmp_results$results$pair_a <- as.character(pair[[1]])
+      tmp_results$results$pair_b <- as.character(pair[[2]])
+      
+      # Save significant results only
+      maaslin2_signif_results <- bind_rows(
+        maaslin2_signif_results,
+        tmp_results$results %>% filter(qval <= fdr_threshold)
+      )
+      
+      # Save all results
+      maaslin2_all_results <- bind_rows(
+        maaslin2_all_results,
+        tmp_results$results
+      )
+    }
+  }
+  
+  # New FDR 
+  if (skip_fdr_correction){
+    maaslin2_all_results$FDR <- maaslin2_all_results$pval
+  } else {
+    maaslin2_all_results$FDR <- p.adjust(maaslin2_all_results$pval, 'fdr')
+  }
+  maaslin2_signif_results <- maaslin2_all_results[maaslin2_all_results$FDR < fdr_threshold,]
+  
+  # Return significant results only for column in metadata_cols_to_analyze (and not in metadata_cols_fix_effects).
+  maaslin2_signif_results <- maaslin2_signif_results[maaslin2_signif_results$metadata %in% metadata_cols_to_analyze, ]
+  
+  # Generate plots to plots list
+  plots <- list()
+  
+  if (nrow(maaslin2_signif_results) > 0) {
+    if (return_maaslin_plots) {
+      png_list <- fs::dir_ls(path = output_dir, recurse = TRUE, type = "file", glob = "*.png")
+      for (png_dir in png_list){
+        print(png_dir)
+        plots[[png_dir]] <- rasterGrob(readPNG(png_dir))
+      }
+    } else {
+      
+      # Fix feature names to match how maaslin outputs them
+      feat_table2 <- feat_table
+      names(feat_table2) <- make.names(names(feat_table2))
+      
+      
+      for (col in unique(maaslin2_signif_results$metadata)){
+        for (feat in unique(maaslin2_signif_results$feature)){
+          
+          unique_signif_results <- maaslin2_signif_results[(maaslin2_signif_results$metadata == col) & (maaslin2_signif_results$feature == feat), ]
+          if (dim(unique_signif_results)[1] == 0)
+            next
+          
+          
+          tmp_metadata <- disct_metadata %>% tidyr::drop_na(col)
+          samples_to_include <- intersect(row.names(tmp_metadata), row.names(feat_table2))
+          tmp_metadata <- tmp_metadata[samples_to_include,,drop=FALSE]
+          feat_table2 <- feat_table[samples_to_include,,drop=FALSE]
+          
+          tmp <- data.frame(
+            col_vals = tmp_metadata[[col]],
+            feat_vals = feat_table2[[feat]]
+          )
+          
+          if (!is.null(category_name_map)) 
+            tmp$col_vals <- factor(category_name_map[as.character(tmp$col_vals)],
+                                   levels = unname(category_name_map))
+          
+          y_m <- max(tmp$feat_vals) 
+          tmp$col_vals<- as.character(tmp$col_vals)
+          
+          # Add number of samples in each group to the x-axis ticks.
+          xlabs <- list()
+          for (val in as.character(unique(tmp$col_vals)))
+            xlabs[[val]] = paste0(val,"\n(", dim(tmp[as.character(tmp$col_vals) == val,])[1], ")")
+          
+          # Sort the tmp dataset based on the specified order
+          if (!is_null(ord)){     
+            tmp$col_vals <- factor(tmp$col_vals, levels = ord)
+            tmp <- tmp[order(tmp$col_vals), ]
+          }
+          
+          p <- ggplot(tmp, aes(x = col_vals, group = col_vals, y = feat_vals)) +
+            geom_boxplot(aes(fill = col_vals), color = 'black', alpha = 0.7, outlier.shape = NA) +
+            geom_jitter(height = 0, width = 0.1, alpha = 0.5, color = 'black', size = 1) +
+            theme_classic() + labs(x = col, y = "Abundance", subtitle = feat) +
+            scale_x_discrete(labels=xlabs)
+          
+          
+          unique_signif_results$group1 <- unique_signif_results$pair_a
+          unique_signif_results$group2 <- unique_signif_results$pair_b
+          
+          makeStars <- function(x){
+            stars <- c("***", "**", "*")
+            vec <- c(0, fdr_threshold/100, fdr_threshold/10 ,fdr_threshold)
+            i <- findInterval(x, vec)
+            stars[i]
+          }
+          
+          unique_signif_results$FDR <- makeStars(unique_signif_results$FDR)
+          
+          p <- p + stat_pvalue_manual(unique_signif_results,
+                                      y.position = max(tmp$feat_vals),
+                                      step.increase = 0.1 ,
+                                      label = "FDR")
+          
+          # Log scale y axis if needed
+          if (logscale_y_for_plot) {
+            p <- p + yscale("log10", .format = TRUE)
+          }
+          plots[[paste(col, feat, collapse = ';')]] <- p
+        }
+      }
+    } 
+  }
+  
+  if (! keep_maaslin_plots){
+    unlink(output_dir, recursive=TRUE)
+  }
+  
+  
+  return(list(sig_results = maaslin2_signif_results, all_results = maaslin2_all_results, plots = plots))
+}
