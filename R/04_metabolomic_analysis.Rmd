@@ -8,7 +8,7 @@ library(ggplot2)
 library(dplyr)
 
 theme_set(theme_bw(base_size = 15))
-source("code/R/categorical_metadata_analysis.R")
+#source("code/R/categorical_metadata_analysis.R") # functions now in statistics.R
 source("code/R/visualization.R")
 source("code/R/statistics.R")
 source("code/R/utils.R")
