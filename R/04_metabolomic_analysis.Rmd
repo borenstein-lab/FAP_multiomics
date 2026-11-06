@@ -8,10 +8,9 @@ library(ggplot2)
 library(dplyr)
 
 theme_set(theme_bw(base_size = 15))
-source("code/R/categorical_metadata_analysis.R")
-source("code/R/visualization.R")
-source("code/R/statistics.R")
-source("code/R/utils.R")
+source("code/FAP_multiomics/R/visualization.R")
+source("code/FAP_multiomics/R/statistics.R")
+source("code/FAP_multiomics/R/utils.R")
 ```
 
 # 1. Data Preparation 
@@ -268,7 +267,6 @@ for (d in list(d_all, d_subset)){
 p <- cowplot::plot_grid(plotlist = p_list)
 ggsave("figures/f2/med_diet.svg", p, height = 3, width = 10)
 ```
-
 
 # 3. Data preparation for pathway enrichment analysis
 ```{r}
@@ -530,46 +528,111 @@ createNetworkFromDataFrames(
   )
 ```
 
-## 5. Mimosa 
+# 5. Supplementary - age balanced subset
+Repeat the PCA, univariate and pathway analyses on the age balanced subset (defined in 03_taxonomic_analysis)
 ```{r}
-mimosa_metabolomics <- data %>% left_join(mdata %>% select(patient_id, sample_id), by = "sample_id") %>% 
-                       select(-sample_id) %>% 
-                       tibble::column_to_rownames("patient_id") %>% t() %>% as.data.frame() %>% 
-                       tibble::rownames_to_column("compound_id")
-mimosa_metabolomics <- matched_compounds %>% left_join(mimosa_metabolomics, by = "compound_id") %>% 
-                       select(-compound_id) %>% rename(KEGG = kegg_id)
+age_balanced <- read.csv("metadata/clean/age_balanced_subset.csv")
+mdata_balanced <- mdata %>% filter(gsub(" Cohort", "", patient_id) %in% age_balanced$patient_id)
+data_balanced <- data %>% filter(sample_id %in% mdata_balanced$sample_id)
+mdata_balanced %>% count(phenotype)
 ```
 
+### PCA
 ```{r}
-sample_to_patient <- mdata_all %>% filter(patient_id %in% colnames(mimosa_metabolomics)) %>% 
-                     filter(batch == "Batch 22" | patient_id %in% c("4_FAP Cohort", "7_FAP Cohort")) %>% 
-                     select(sample_id, patient_id)
+pca_result <- data_balanced %>% tibble::column_to_rownames(var = "sample_id") %>% prcomp(center = F, scale = F)
+pca_df <- pca_result$x %>% as.data.frame() %>% select(PC1, PC2) %>% tibble::rownames_to_column("sample_id") %>%
+  left_join(mdata, by = "sample_id")
+var_exp <- (summary(pca_result)$importance[2,][1:2] %>% unname() * 100) %>% round(.,1)
+wilcox_test_by_pair(pca_df, "phenotype", "PC1 ~ phenotype", FALSE) %>% add_significance()
+```
+
+```{r, fig.width=3.75, fig.height=3}
+ggp_scatter <- ggplot(pca_df, aes(PC1, PC2, color = phenotype, fill = phenotype)) +
+      geom_point(size = 2, alpha = 0.7) +
+      labs( x = paste0('Axis PC1 (',var_exp[1], '% variance explained)'),
+             y = paste0('Axis PC2 (',var_exp[2], '% variance explained)'),
+            color = "", fill = "") +
+      scale_color_manual(values = palette) + theme_bw(base_size = 10)  + theme(legend.position = "top")
+ggp_density_x <- ggplot(pca_df, aes(PC1,color = phenotype, fill = phenotype)) +
+                geom_boxplot(alpha = 0) +
+               scale_fill_manual(values = palette)  + scale_color_manual(values = palette) +
+               theme_classic()
+ggp_density_y <- ggplot(pca_df, aes(PC2,color = phenotype, fill = phenotype)) +
+                geom_boxplot(alpha = 0) +
+               scale_fill_manual(values = palette)  + scale_color_manual(values = palette) +
+               theme_classic() + coord_flip()
+
+pca_plot <- cowplot::insert_xaxis_grob(ggp_scatter, ggp_density_x, grid::unit(.2, "null"), position = "top")
+pca_plot<- cowplot::insert_yaxis_grob(pca_plot, ggp_density_y, grid::unit(.2, "null"), position = "right")
+pca_balanced <- cowplot::ggdraw(pca_plot)
+pca_balanced
+ggsave(file="figures/f2/supp_sens_pca.svg", plot=pca_balanced, width=3.75, height=3)
+```
+
+### Volcano plot
+```{r}
+ggdata <- data_balanced %>% left_join(mdata %>% select(sample_id, phenotype, phenotype_binary, age, gender, bmi), by = "sample_id") %>%
+  mutate(phenotype_binary = factor(phenotype_binary, levels = c("FAP", "Control")))
+result_balanced <- data.frame()
+for (i in seq_along(metabolites)){
+  set.seed(111 + i)
+  result_balanced <- rbind(result_balanced, perm_ancova_pairs(ggdata, metabolites[i], "phenotype_binary", regressors))
+}
+volcano_data_balanced <- result_balanced %>% mutate(p_value_adj = p.adjust(p_value_perm_pair , method = "fdr")) %>%
+                rename(compound_id = feature) %>%
+                left_join(compound_names, by ="compound_id") %>%
+                mutate(log_p_value = -log10(p_value_adj),
+         is_enriched = (p_value_adj <  0.05 & abs(hedges_g ) > 0.5),
+         enrichment_group = ifelse(hedges_g  > 0 , "Control", "FAP"),
+         enrichment_group = ifelse(is_enriched, enrichment_group, "Non-significant"),
+         label = ifelse(enrichment_group == "Non-significant", "", compound_name),
+         label = gsub("\\/.*", "", label))
+
+# compare to the metabolites found in the full data
+volcano_data %>% select(compound_id, enrichment_group) %>%
+  left_join(volcano_data_balanced %>% select(compound_id, enrichment_group_balanced = enrichment_group), by = "compound_id") %>%
+  count(enrichment_group, enrichment_group_balanced)
+```
+
+```{r, fig.width=3.75, fig.height=3}
+p_volcano_balanced <- plot_volcano(volcano_data_balanced, y_var = "log_p_value", x_var =  "effect_size",
+             color_var = "enrichment_group", label = "label",fdr_min = 0.05,
+             coef_min = 0.5, n_label_overlaps = 9, label_size = 2.5, point_size = 1) +
+  scale_color_manual(values = palette) + theme(legend.position = "top", text = element_text(size = 10)) +
+  labs(x = "Effect size [Hedge's g]")
+p_volcano_balanced
+ggsave(file="figures/f2/supp_sens_volcano.svg", plot=p_volcano_balanced, width=3.75, height=3)
+```
+
+### Pathway enrichment
+```{r}
+df <- volcano_data_balanced %>% left_join(matched_compounds, by =  "compound_id") %>%
+        filter(!is.na(kegg_id), !kegg_id %in% keggid_to_remove)
+fap_enriched <- run_ora_on_pathway_list(df %>% filter(enrichment_group == "FAP", p_value_adj < 0.05) %>% pull(kegg_id), pathway_list, universe)
+ctrl_enriched <- run_ora_on_pathway_list(df %>% filter(enrichment_group == "Control", p_value_adj < 0.05) %>% pull(kegg_id), pathway_list, universe)
+
+sig_res_balanced <- rbind(fap_enriched %>% mutate(label = "FAP"), ctrl_enriched %>% mutate(label = "Control")) %>%
+                  mutate(fdr = p.adjust(p_value, method = "fdr"),
+                         pathway = paste0(pathway, " (",n_intersect,"/",pathway_size,")")) %>%
+                  filter(fdr < 0.05) %>% arrange(desc(odds_ratio))
+
+# compare to the pathways found in the full data
+sig_res %>% select(pathway, label) %>%
+  mutate(pathway = gsub(" \\([0-9]+/[0-9]+\\)$", "", pathway),
+         in_balanced = paste(pathway, label) %in% paste(gsub(" \\([0-9]+/[0-9]+\\)$", "", sig_res_balanced$pathway), sig_res_balanced$label))
+```
+
+```{r, fig.width=7.5, fig.height=3}
+dotplot_balanced <- ggplot(sig_res_balanced, aes(x = log(odds_ratio), y = reorder(pathway,odds_ratio),  size = -log10(fdr), color = label)) +
+           geom_point() +
+           scale_color_manual(values = palette) +
+       labs(y = "ORA enriched pathway", x = "log(Odds ratio)",
+            color = "Enrichment\ngroup", size = "-log10(FDR)") +
+       theme_bw(base_size = 10) + theme(legend.box = "horizontal")
+dotplot_balanced
+ggsave(file="figures/f2/supp_sens_dotplot.svg", plot=dotplot_balanced, width=7.5, height=3)
 ```
 
 
-
-```{r}
-mimosa_picrust <- read.csv("qiime/combined/7_PICRUST2/KO_metagenome_out/pred_metagenome_contrib.tsv", sep = "\t")
-```
-
-```{r}
-picrust_samples  <- mimosa_picrust$sample %>% unique()
-picrust_samples <- gsub("tasmul-","",picrust_samples ) %>% gsub("-.*", "", .)
-target_samples <- intersect(sample_to_patient$sample, picrust_samples)
-
-mimosa_picrust_subset <- mimosa_picrust %>% filter(sample %in% target_samples) %>%
-                         left_join(sample_to_patient, by = c("sample" = "sample_id")) %>% 
-                         select(-sample) %>% 
-                         relocate(patient_id, .before = 1) %>% rename(sample = patient_id) %>% 
-                         select(1,2,3,6,5,8)
-
-colnames(mimosa_picrust_subset) <- c("Sample", "Gene", "OTU", "GeneCountPerGenome",
-                                     "OTUAbundanceInSample",	"CountContributedByOTU")
-```
-
-```{r}
-#write.csv(mimosa_metabolomics, "processed_data/mimosa_metabolomics.csv", row.names = F)
-#write.csv(mimosa_picrust_subset, "processed_data/mimosa_picrust.csv", row.names = F)
-```
 
 
