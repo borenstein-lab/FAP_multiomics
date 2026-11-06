@@ -10,10 +10,9 @@ library(tidyr)
 library(tibble)
 
 theme_set(theme_bw(base_size = 15))
-#source("code/R/categorical_metadata_analysis.R") # functions now in statistics.R
-source("code/R/visualization.R")
-source("code/R/utils.R")
-source("code/R/statistics.R")
+source("code/FAP_multiomics/R/visualization.R")
+source("code/FAP_multiomics/R/utils.R")
+source("code/FAP_multiomics/R/statistics.R")
 ```
 
 ```{r}
@@ -342,4 +341,193 @@ fig_1
 #ggsave(file="figures/f1/f1_volcao_bac.svg", plot=volcano, width=4, height=6)
 ```
 
+## 2.5 Sensitivity analyses (supplementary)
+Repeat the main analyses (F/B ratio, alpha and beta diversity, differential abundance) on two subsets:
+1. Single batch - batch 22 samples only, without the mean samples (all controls were sequenced in batch 22, so batch can't be added as a covariate)
+2. Age balanced - the largest subset of subjects in which FAP patients and controls don't differ in age
 
+### 2.5.1 Single batch
+```{r}
+genus_ra_pre <- read.csv("processed_data/genus_ra_pre_batch_merge.csv")
+colnames(genus_ra_pre) <- colnames(genus_ra_pre) %>% gsub(".*g__","",.)
+
+batch_22_samples <- mdata_all %>% filter(batch == "Batch 22", sample_id %in% genus_ra_pre$sample_id) %>% pull(sample_id)
+taxa_df_b22 <- genus_ra_pre %>% filter(sample_id %in% batch_22_samples) %>% tibble::column_to_rownames("sample_id") %>%
+               remove_rare_features(prevalence_cutoff = 0.1, avg_abundance_cutoff = 0.001, rescale = T) %>%
+               tibble::rownames_to_column("sample_id")
+```
+
+Batch effect between the two samples of patients sequenced in both batches (permutations within patient)
+```{r}
+replicate_samples <- mdata_all %>% filter(sample_id %in% genus_ra_pre$sample_id) %>%
+                     group_by(patient_id) %>% filter(n() > 1) %>% ungroup() %>% select(sample_id, patient_id, batch)
+replicate_ra <- genus_ra_pre %>% filter(sample_id %in% replicate_samples$sample_id) %>%
+                select(sample_id, all_of(colnames(taxa_df)[-1])) %>% tibble::column_to_rownames("sample_id")
+replicate_ra <- replicate_ra / rowSums(replicate_ra)
+replicate_mdata <- replicate_samples[match(rownames(replicate_ra), replicate_samples$sample_id), ]
+
+replicate_dist <- vegan::vegdist(replicate_ra, method = "bray")
+set.seed(111)
+replicate_permanova <- vegan::adonis2(replicate_dist ~ patient_id + batch, data = replicate_mdata, by = "terms",
+                                      permutations = permute::how(blocks = replicate_mdata$patient_id, nperm = 9999))
+replicate_permanova
+```
+
+### 2.5.2 Age balanced
+FAP patients (mainly classical FAP) are younger than the controls. Try all combinations of a minimal age for FAP patients and a maximal age for controls, and keep the combination with the largest number of subjects in which the groups don't differ in age (Wilcoxon p > 0.05 and standardized mean difference |SMD| < 0.25)
+```{r}
+smd <- function(x, is_fap) (mean(x[is_fap]) - mean(x[!is_fap])) / sd(x[is_fap])
+
+cutoffs <- expand.grid(min_fap_age = sort(unique(mdata$age[mdata$is_fap])),
+                       max_control_age = sort(unique(mdata$age[!mdata$is_fap])))
+age_cutoffs <- data.frame()
+for (i in 1:nrow(cutoffs)){
+  d <- mdata %>% filter((is_fap & age >= cutoffs$min_fap_age[i]) | (!is_fap & age <= cutoffs$max_control_age[i]))
+  if (sum(d$is_fap) < 5) next
+  age_cutoffs <- rbind(age_cutoffs, data.frame(cutoffs[i, ], n = nrow(d), n_fap = sum(d$is_fap),
+                                               smd_age = smd(d$age, d$is_fap),
+                                               p_value = wilcox.test(age ~ is_fap, data = d, exact = FALSE)$p.value))
+}
+age_cutoff <- age_cutoffs %>% filter(p_value > 0.05, abs(smd_age) < 0.25) %>% arrange(desc(n), abs(smd_age)) %>% slice(1)
+age_cutoff
+```
+
+```{r}
+age_balanced <- mdata %>% filter((is_fap & age >= age_cutoff$min_fap_age) | (!is_fap & age <= age_cutoff$max_control_age))
+age_balanced %>% group_by(phenotype) %>% summarise(n = n(), mean_age = mean(age), min_age = min(age), max_age = max(age))
+write.csv(age_balanced %>% select(patient_id, sample_id, phenotype, age), "metadata/clean/age_balanced_subset.csv", row.names = FALSE)
+```
+
+### 2.5.3 Analysis
+Phylum relative abundance per patient, as in 2.1 but for a given set of samples
+```{r}
+get_patient_phyla <- function(samples){
+  relab_phy[samples, ] %>% rownames_to_column("sample_id") %>%
+    tidyr::pivot_longer(cols = -sample_id, names_to = "taxon", values_to = "ra") %>%
+    mutate(taxon = ifelse(taxon %in% non_rare_phyla, taxon, "Other")) %>%
+    group_by(sample_id, taxon) %>% summarise(ra = sum(ra)) %>% ungroup() %>%
+    inner_join(mdata_all, by = "sample_id") %>%
+    group_by(patient_id, phenotype, phenotype_binary, taxon) %>% summarise(ra = mean(ra)) %>% ungroup()
+}
+
+sens_taxa <- list("Single batch" = taxa_df_b22,
+                  "Age balanced" = taxa_df %>% filter(sample_id %in% age_balanced$sample_id))
+sens_phyla_samples <- list("Single batch" = batch_22_samples,
+                           "Age balanced" = mdata_all %>% filter(patient_id %in% age_balanced$patient_id,
+                                                                sample_id %in% rownames(relab_phy)) %>% pull(sample_id))
+```
+
+```{r}
+fb_sens <- data.frame()
+alpha_sens <- data.frame()
+beta_sens <- data.frame()
+beta_plots <- list()
+maaslin_sens <- data.frame()
+ancova_sens <- data.frame()
+
+for (src in names(sens_taxa)){
+  taxa <- sens_taxa[[src]]
+  md <- mdata_all %>% filter(sample_id %in% taxa$sample_id)
+
+  # F/B ratio
+  fb <- calculate_phyla_ratio(get_patient_phyla(sens_phyla_samples[[src]]), num, denom) %>%
+        mutate(phenotype = factor(phenotype, levels = label_order), log2_ratio = log2(ratio)) %>%
+        left_join(patient_mdata %>% select(all_of(c("patient_id", regressors))), by = "patient_id")
+  set.seed(111)
+  ancova_sens <- rbind(ancova_sens, perm_ancova_pairs(df = fb, X = "ratio", group = "phenotype", covariates = regressors) %>%
+                                    mutate(source = src))
+  fb_sens <- rbind(fb_sens, fb %>% mutate(source = src))
+
+  # alpha diversity
+  for (metric in alpha_div_metrics){
+    div <- vegan::diversity(taxa %>% tibble::column_to_rownames("sample_id"), index = metric)
+    div_df <- data.frame(sample_id = names(div), metric = div) %>%
+              left_join(md, by = "sample_id") %>%
+              mutate(phenotype = factor(phenotype, levels = label_order))
+    set.seed(111)
+    ancova_sens <- rbind(ancova_sens, perm_ancova_pairs(df = div_df, X = "metric", group = "phenotype", covariates = regressors) %>%
+                                      mutate(feature = metric, source = src))
+    alpha_sens <- rbind(alpha_sens, div_df %>% select(sample_id, phenotype, value = metric) %>% mutate(index = metric, source = src))
+  }
+
+  # beta diversity
+  genus_dist <- vegan::vegdist(taxa %>% tibble::column_to_rownames("sample_id"), method = "bray") %>% as.matrix()
+  md <- md[match(rownames(genus_dist), md$sample_id), ]
+  set.seed(111)
+  permanova <- vegan::adonis2(as.dist(genus_dist) ~ phenotype, data = md, permutations = 9999)
+  bd <- vegan::betadisper(d = as.dist(genus_dist), group = md$phenotype, bias.adjust = TRUE)
+  beta_sens <- rbind(beta_sens, data.frame(source = src, r2 = permanova$R2[1], p_permanova = permanova$`Pr(>F)`[1],
+                                           p_dispersion = anova(bd)$`Pr(>F)`[1]))
+  beta_plots[[src]] <- plot_colored_pcoa_discrete(genus_dist %>% as.data.frame() %>% rownames_to_column("sample_id"),
+                                                  md %>% mutate(phenotype = factor(phenotype, levels = label_order)),
+                                                  "sample_id", "phenotype", "Bray-Curtis", pcoa_fill = palette, level = 0.9)$p
+
+  # differential abundance
+  da <- get_differential_abundance(taxa, md, metadata_cols_to_analyze = c("phenotype_binary"), metadata_cols_fix_effects = regressors)
+  maaslin_sens <- rbind(maaslin_sens, da$all_results %>% filter(!metadata %in% regressors) %>% mutate(source = src))
+}
+
+ancova_sens %>% select(source, feature, contrast, effect_size, hedges_g, p_value_perm_pair)
+beta_sens
+```
+
+```{r}
+ggdata <- maaslin_sens %>%
+           mutate(is_significant = FDR < 0.05,
+           is_coef = abs(coef) > 1,
+           is_highlight = is_significant & is_coef,
+           label = ifelse(is_highlight, feature, ""),
+           color = ifelse(is_highlight & coef < 1, labels[[1]], labels[[2]]),
+           color = ifelse(!is_highlight,"Non-Significant", color),
+           source = factor(source, levels = names(sens_taxa)))
+
+# compare to the genera found in the full data
+ggdata %>% left_join(maaslin_features %>% select(feature, original = `maaslin taxonomy`), by = "feature") %>%
+           count(source, original, color)
+```
+
+### 2.5.4 Supplementary panels
+Panel sizes are set to fit a 7.5 x 7.5 inch slide (top row: F/B ratio, Shannon, Simpson; bottom row: beta diversity of the two subsets one above the other, volcano)
+```{r, fig.width=2.5, fig.height=2.5}
+fb_sens <- fb_sens %>% mutate(source = factor(source, levels = names(sens_taxa)))
+fb_ratio_sens <- ggplot(fb_sens, aes(phenotype, log2_ratio, fill = phenotype, color = phenotype)) +
+                 plot_box_and_jitter(palette, font_size = 10, point_size = 1) +
+                 facet_wrap(~source) +
+                 theme(axis.text.x = element_text(size = 7, angle = 45, hjust = 1)) +
+                 labs(x = "Phenotype", y = "F/B Ratio [log2]")
+fb_ratio_sens
+ggsave("figures/f1/supp_sens_fb_ratio.svg", fb_ratio_sens, width = 2.5, height = 2.5)
+```
+
+```{r, fig.width=2.5, fig.height=2.5}
+alpha_sens <- alpha_sens %>% mutate(source = factor(source, levels = names(sens_taxa)))
+for (metric in alpha_div_metrics){
+  ggp <- ggplot(alpha_sens %>% filter(index == metric), aes(phenotype, value, fill = phenotype, color = phenotype)) +
+         plot_box_and_jitter(palette, font_size = 10, point_size = 1) +
+         facet_wrap(~source) +
+         theme(axis.text.x = element_text(size = 7, angle = 45, hjust = 1)) +
+         labs(x = "Phenotype", y = paste(stringr::str_to_title(metric), "diversity"))
+  plot(ggp)
+  ggsave(paste0("figures/f1/supp_sens_alpha_div_", metric, ".svg"), ggp, width = 2.5, height = 2.5)
+}
+```
+
+```{r, fig.width=3.75, fig.height=2.5}
+for (src in names(beta_plots)){
+  ggp <- beta_plots[[src]] +
+         labs(fill = "", title = src) +
+         theme(text = element_text(size = 10), legend.position = "none")
+  plot(ggp)
+  ggsave(paste0("figures/f1/supp_sens_beta_div_", gsub(" ", "_", tolower(src)), ".svg"), ggp, width = 3.75, height = 2.5)
+}
+```
+
+```{r, fig.width=5, fig.height=3.75}
+volcano_sens <- plot_volcano(ggdata, n_label_overlaps = 7, label_size = 2.5, fdr_min = 0.05, point_size = 1.5) +
+                facet_wrap(~source, ncol = 2) +
+                scale_color_manual(values = palette) +
+                guides(color = guide_legend(title = NULL)) +
+                theme_bw(base_size = 10) + theme(legend.position = "none")
+volcano_sens
+ggsave("figures/f1/supp_sens_volcano.svg", volcano_sens, width = 3.75*2, height = 2.5)
+```

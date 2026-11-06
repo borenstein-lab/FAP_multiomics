@@ -7,9 +7,9 @@ output:
 ```{r}
 library(ggplot2)
 library(dplyr)
-source("code/R/utils.R")
-source("code/R/visualization.R")
-source("code/R/statistics.R")
+source("code/FAP_multiomics/R/utils.R")
+source("code/FAP_multiomics/R/visualization.R")
+source("code/FAP_multiomics/R/statistics.R")
 theme_set(theme_bw(base_size = 15))
 ```
 
