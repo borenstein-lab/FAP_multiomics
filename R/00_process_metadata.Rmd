@@ -6,8 +6,8 @@ output: html_notebook
 ```{r}
 library(dplyr)
 library(ggplot2)
-source("code/R/visualization.R")
-source("code/R/statistics.R")
+source("code/FAP_multiomics/R/visualization.R")
+source("code/FAP_multiomics/R/statistics.R")
 ```
 
 ```{r}
@@ -157,7 +157,7 @@ library(patchwork)
 s1 = (p_age + p_bmi)/(p_polyps + p_gender)/(p_smoking + p_surgery) + 
       patchwork::plot_annotation(tag_levels = 'A')
 plot(s1)
-ggsave("figures/S1_metadata.svg", s1, width = 21, height = 21.3, units = "cm")
+#ggsave("figures/S1_metadata.svg", s1, width = 21, height = 21.3, units = "cm")
 ```
 
 ```{r}
@@ -189,5 +189,45 @@ ggp <- ggplot(df, aes(phenotype, med_diet_sum, color = phenotype, fill = phenoty
        labs(x = "", y = "Mediterranean diet score")
 #ggsave("figures/f2/med_diet_all.svg", ggp, height = 4, width = 4)
 ```
+
+## Table 1
+```{r}
+library(gtsummary)
+
+table_data <- df %>% select(phenotype, age,  gender, bmi, is_ever_smoker ,surgery_type) %>%
+              mutate(phenotype = factor(phenotype, levels = c("Control", "Non-classical FAP", "Classical FAP")),
+                     sex = factor(gender),
+                    is_ever_smoker = factor(is_ever_smoker ))
+
+table1 <- table_data %>%tbl_summary(by = phenotype, 
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"),
+    label = list(
+      age ~ "Age (years)",
+      sex ~ "Sex",
+      bmi ~ "BMI (kg/m²)",
+      is_ever_smoker ~ "Smoking Status",
+      surgery_type ~ "Surgical History"
+    ),
+    missing = "ifany" 
+  ) %>%
+  add_overall() %>%
+  bold_labels() %>%
+  italicize_levels() %>%
+  modify_caption("**Table 1. Demographic and Clinical Characteristics of the Study Population**")
+
+# 4. View the table
+table1
+#gtsummary::as_flex_table(table1) %>% flextable::save_as_docx(path = "figures/f1/Table1_Demographics.docx")
+```
+
+```{r}
+pdftools::pdf_convert("figures/f1/Table1_Demographics.pdf", 
+            format = "png", 
+            dpi = 300, 
+            filenames = "figures/f1/Table1_Demographics.png")
+```
+
 
 
