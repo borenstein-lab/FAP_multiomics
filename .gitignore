@@ -1,0 +1,4 @@
+*.nb.html
+.Rhistory
+.RData
+.Rproj.user/
