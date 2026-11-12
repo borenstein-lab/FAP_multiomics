@@ -5,7 +5,7 @@ This repository contains the analysis code for the paper **"Fecal Microbiome and
 
 Familial Adenomatous Polyposis (FAP) is an early-onset colorectal cancer syndrome. This study integrates gut microbiome profiles (16S rRNA), fecal metabolomics (LC-MS), and clinical blood biochemistry to identify robust multi-omic signatures that track with disease severity (Classical vs. Attenuated phenotypes).
 
-The pipeline performs quality control, batch correction, taxonomic/metabolomic profiling, and integrated multi-omic analysis combining taxonomy, metabolomics and blood biochemistry test results to predict and characterize FAP.
+The pipeline performs quality control, batch correction, taxonomic/metabolomic profiling, sensitivity analysis, and integrated multi-omic analysis combining taxonomy, metabolomics and blood biochemistry test results to predict and characterize FAP.
 
 ## Repository Structure
 
